@@ -12,3 +12,11 @@ dist/
 .vscode/*
 !.vscode/extensions.json
 .idea/
+
+# Convex AI dosyaları (`npx convex ai-files install` ile yeniden üretilir)
+.agents/
+.claude/skills/
+CLAUDE.md
+AGENTS.md
+skills-lock.json
+convex/_generated/ai/
