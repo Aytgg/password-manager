@@ -1,9 +1,6 @@
 import { defineSchema, defineTable } from "convex/server";
 import { v } from "convex/values";
 
-// Sunucu yalnızca şifreli veri saklar. Tüm şifreleme ve çözme Tauri
-// uygulamasının Rust tarafında yapılır; ikili değerler base64 metindir.
-
 export const sealedField = v.object({
   nonce: v.string(),
   ciphertext: v.string(),
@@ -15,35 +12,61 @@ export const wrappedKey = v.object({
   ciphertext: v.string(),
 });
 
+export const role = v.union(
+  v.literal("admin"),
+  v.literal("manager"),
+  v.literal("member"),
+);
+
+export const userStatus = v.union(
+  v.literal("invited"),
+  v.literal("active"),
+  v.literal("disabled"),
+);
+
 export default defineSchema({
+  departments: defineTable({
+    name: v.string(),
+    createdAt: v.number(),
+  }).index("by_name", ["name"]),
+
   users: defineTable({
-    // Clerk kullanıcı kimliği (JWT `sub`).
-    clerkId: v.string(),
     email: v.string(),
-    displayName: v.string(),
-    // X25519 açık anahtarı. Özel anahtar yalnızca kullanıcının cihazında.
-    publicKey: v.string(),
+    clerkId: v.optional(v.string()),
+    displayName: v.optional(v.string()),
+    publicKey: v.optional(v.string()),
+    role,
+    departmentId: v.optional(v.id("departments")),
+    status: userStatus,
+    createdAt: v.number(),
     updatedAt: v.number(),
-  }).index("by_clerk_id", ["clerkId"]),
+  })
+    .index("by_clerk_id", ["clerkId"])
+    .index("by_email", ["email"])
+    .index("by_department", ["departmentId"]),
 
   items: defineTable({
-    // İstemcinin ürettiği kimlik; şifreli alanların AAD'sine bağlıdır.
     itemId: v.string(),
     ownerId: v.string(),
-    // Başlık ve kullanıcı adı (JSON), kaydın DEK'i ile şifreli.
     metadata: sealedField,
-    // Parolanın kendisi, kaydın DEK'i ile şifreli.
     secret: sealedField,
-    // Her rekey işleminde artar; eşzamanlı değişiklikleri reddetmek için.
     keyVersion: v.number(),
+    needsRekey: v.boolean(),
     createdAt: v.number(),
     updatedAt: v.number(),
   })
     .index("by_item_id", ["itemId"])
     .index("by_owner", ["ownerId"]),
 
-  // Kaydın DEK'inin, erişimi olan her kullanıcının açık anahtarına
-  // paketlenmiş hali. Satır yoksa kullanıcının erişimi yoktur.
+  itemGrants: defineTable({
+    item: v.id("items"),
+    userId: v.optional(v.string()),
+    departmentId: v.optional(v.id("departments")),
+  })
+    .index("by_item", ["item"])
+    .index("by_user", ["userId"])
+    .index("by_department", ["departmentId"]),
+
   itemAccess: defineTable({
     item: v.id("items"),
     userId: v.string(),

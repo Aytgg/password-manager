@@ -1,22 +1,164 @@
 import { ConvexError } from "convex/values";
 import type { Infer } from "convex/values";
 
-import type { QueryCtx } from "./_generated/server";
+import type { Doc, Id } from "./_generated/dataModel";
+import type { MutationCtx, QueryCtx } from "./_generated/server";
 import type { sealedField, wrappedKey } from "./schema";
 
-export async function requireUserId(ctx: QueryCtx): Promise<string> {
+export const DEFAULT_DEPARTMENTS = ["Yazılım", "Satış", "Destek", "Diğer"];
+
+export function normalizeEmail(email: string): string {
+  return email.trim().toLowerCase();
+}
+
+export async function requireIdentity(ctx: QueryCtx) {
   const identity = await ctx.auth.getUserIdentity();
 
   if (!identity) {
     throw new ConvexError("Oturum doğrulanamadı.");
   }
 
-  return identity.subject;
+  return identity;
+}
+
+export async function findUserByClerkId(ctx: QueryCtx, clerkId: string) {
+  return await ctx.db
+    .query("users")
+    .withIndex("by_clerk_id", (q) => q.eq("clerkId", clerkId))
+    .unique();
+}
+
+export async function requireActiveUser(ctx: QueryCtx): Promise<Doc<"users">> {
+  const identity = await requireIdentity(ctx);
+  const user = await findUserByClerkId(ctx, identity.subject);
+
+  if (!user || user.status !== "active") {
+    throw new ConvexError("Bu hesabın sisteme erişim yetkisi yok.");
+  }
+
+  return user;
+}
+
+export async function requireAdmin(ctx: QueryCtx): Promise<Doc<"users">> {
+  const user = await requireActiveUser(ctx);
+
+  if (user.role !== "admin") {
+    throw new ConvexError("Bu işlem yalnızca yönetici tarafından yapılabilir.");
+  }
+
+  return user;
+}
+
+export function canManageUser(actor: Doc<"users">, target: Doc<"users">): boolean {
+  if (actor._id === target._id) {
+    return false;
+  }
+
+  if (actor.role === "admin") {
+    return true;
+  }
+
+  return (
+    actor.role === "manager" &&
+    actor.departmentId !== undefined &&
+    target.departmentId === actor.departmentId &&
+    target.role === "member"
+  );
+}
+
+export function isReachable(
+  user: Doc<"users">,
+): user is Doc<"users"> & { clerkId: string; publicKey: string } {
+  return (
+    user.status === "active" &&
+    user.clerkId !== undefined &&
+    user.publicKey !== undefined
+  );
+}
+
+export async function allowedUsers(
+  ctx: QueryCtx,
+  item: Doc<"items">,
+): Promise<Map<string, Doc<"users"> & { clerkId: string; publicKey: string }>> {
+  const allowed = new Map<
+    string,
+    Doc<"users"> & { clerkId: string; publicKey: string }
+  >();
+
+  const add = (user: Doc<"users"> | null) => {
+    if (user && isReachable(user)) {
+      allowed.set(user.clerkId, user);
+    }
+  };
+
+  add(await findUserByClerkId(ctx, item.ownerId));
+
+  const grants = await ctx.db
+    .query("itemGrants")
+    .withIndex("by_item", (q) => q.eq("item", item._id))
+    .collect();
+
+  for (const grant of grants) {
+    if (grant.userId !== undefined) {
+      add(await findUserByClerkId(ctx, grant.userId));
+    }
+
+    if (grant.departmentId !== undefined) {
+      const members = await ctx.db
+        .query("users")
+        .withIndex("by_department", (q) =>
+          q.eq("departmentId", grant.departmentId),
+        )
+        .collect();
+
+      members.forEach(add);
+    }
+  }
+
+  return allowed;
+}
+
+export async function removeDisallowedAccess(ctx: MutationCtx, itemId: Id<"items">) {
+  const item = await ctx.db.get(itemId);
+
+  if (!item) {
+    return;
+  }
+
+  const allowed = await allowedUsers(ctx, item);
+
+  const accesses = await ctx.db
+    .query("itemAccess")
+    .withIndex("by_item", (q) => q.eq("item", itemId))
+    .collect();
+
+  let removed = false;
+
+  for (const access of accesses) {
+    if (!allowed.has(access.userId) && access.userId !== item.ownerId) {
+      await ctx.db.delete(access._id);
+      removed = true;
+    }
+  }
+
+  if (removed && !item.needsRekey) {
+    await ctx.db.patch(itemId, { needsRekey: true });
+  }
+}
+
+export async function reconcileUserAccess(ctx: MutationCtx, clerkId: string) {
+  const accesses = await ctx.db
+    .query("itemAccess")
+    .withIndex("by_user", (q) => q.eq("userId", clerkId))
+    .collect();
+
+  for (const access of accesses) {
+    await removeDisallowedAccess(ctx, access.item);
+  }
 }
 
 const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
 
-// 32 bayt -> 44 karakter, 12 bayt -> 16 karakter base64.
 const PUBLIC_KEY_LENGTH = 44;
 const NONCE_LENGTH = 16;
 const MAX_CIPHERTEXT_LENGTH = 16 * 1024;

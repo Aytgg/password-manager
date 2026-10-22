@@ -183,7 +183,6 @@ async fn create_vault(
         std::fs::create_dir_all(&paths.dir)
             .map_err(|error| error.to_string())?;
 
-        // Mevcut kasanın üzerine yazma yalnızca geliştirme ortamında mümkün.
         if paths.has_any_file() && !cfg!(debug_assertions) {
             return Err(
                 "Mevcut kasa dosyaları bulundu. Yayın sürümünde kasa \
@@ -192,7 +191,6 @@ async fn create_vault(
             );
         }
 
-        // Açık olan kasayı (bu ya da başka bir hesabın) bırak.
         session.lock()?;
 
         for path in paths.all_files() {
@@ -411,7 +409,7 @@ fn wrap_item_key_for_recipient(
     let user_id = authenticated_user_id(&session_token)?;
 
     session.with_identity_for_user(&user_id, |identity| {
-        items::wrap_for_recipient(identity, &user_id, &item, &recipient_public_key)
+        items::wrap_for_recipient(identity, &item, &recipient_public_key)
     })
 }
 

@@ -8,8 +8,10 @@
  * @module
  */
 
+import type * as departments from "../departments.js";
 import type * as items from "../items.js";
 import type * as lib from "../lib.js";
+import type * as members from "../members.js";
 import type * as users from "../users.js";
 
 import type {
@@ -19,8 +21,10 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
+  departments: typeof departments;
   items: typeof items;
   lib: typeof lib;
+  members: typeof members;
   users: typeof users;
 }>;
 

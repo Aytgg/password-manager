@@ -259,15 +259,16 @@ pub fn decrypt_secret(
     open(&item.secret, &dek, &secret_aad(&item.owner_id, &item.item_id))
 }
 
-/// Sahibin DEK'ini çözer ve alıcının açık anahtarına paketler.
+/// Çağıranın DEK'ini çözer ve alıcının açık anahtarına paketler.
+///
+/// Kimin erişim alabileceğine sunucudaki paylaşım kuralları karar verir;
+/// kayda erişimi olan her istemci, kurala göre erişimi olması gereken
+/// fakat anahtarı eksik olan kullanıcılar için paket üretebilir.
 pub fn wrap_for_recipient(
     identity: &IdentityKeyPair,
-    owner_id: &str,
     item: &EncryptedItem,
     recipient_public_key: &str,
 ) -> Result<WrappedKeyDto, String> {
-    require_owner(owner_id, item)?;
-
     let dek = unwrap_own_dek(identity, &item.access)?;
 
     // Kaydın gerçekten bu DEK ile şifrelendiğini doğrula; aksi halde alıcıya
@@ -364,7 +365,6 @@ mod tests {
 
         let recipient_access = wrap_for_recipient(
             &owner,
-            "owner",
             &owner_item,
             &encode_public_key(&recipient.public_key()),
         )
@@ -377,16 +377,47 @@ mod tests {
     }
 
     #[test]
-    fn non_owner_cannot_grant_or_rekey() {
+    fn non_owner_cannot_rekey() {
         let owner = IdentityKeyPair::generate();
         let other = IdentityKeyPair::generate();
 
         let new_item = encrypt_new_item(&owner, "owner", "VPN", None, b"pw").unwrap();
         let item = stored(&new_item, "owner", new_item.owner_access.clone());
-        let other_key = encode_public_key(&other.public_key());
 
-        assert!(wrap_for_recipient(&other, "other", &item, &other_key).is_err());
         assert!(rekey(&other, "other", &item, &[]).is_err());
+    }
+
+    #[test]
+    fn recipient_can_wrap_for_another_user_but_stranger_cannot() {
+        let owner = IdentityKeyPair::generate();
+        let recipient = IdentityKeyPair::generate();
+        let third = IdentityKeyPair::generate();
+        let stranger = IdentityKeyPair::generate();
+
+        let new_item = encrypt_new_item(&owner, "owner", "VPN", None, b"pw").unwrap();
+        let owner_item = stored(&new_item, "owner", new_item.owner_access.clone());
+
+        let recipient_item = stored(
+            &new_item,
+            "owner",
+            wrap_for_recipient(&owner, &owner_item, &encode_public_key(&recipient.public_key()))
+                .unwrap(),
+        );
+
+        let third_item = stored(
+            &new_item,
+            "owner",
+            wrap_for_recipient(&recipient, &recipient_item, &encode_public_key(&third.public_key()))
+                .unwrap(),
+        );
+
+        assert_eq!(decrypt_secret(&third, &third_item).unwrap().as_slice(), b"pw");
+
+        // Erişimi olmayan biri, başkasının paketini kullanarak anahtar üretemez.
+        assert!(
+            wrap_for_recipient(&stranger, &recipient_item, &encode_public_key(&stranger.public_key()))
+                .is_err()
+        );
     }
 
     #[test]
@@ -400,7 +431,6 @@ mod tests {
 
         let removed_access = wrap_for_recipient(
             &owner,
-            "owner",
             &owner_item,
             &encode_public_key(&removed.public_key()),
         )

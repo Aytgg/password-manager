@@ -1,16 +1,23 @@
-import { SignIn, SignUp, useAuth, useClerk, useUser } from "@clerk/react";
+import { SignIn, useAuth, useClerk, useUser } from "@clerk/react";
 import { dark } from "@clerk/ui/themes";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import { useMutation } from "convex/react";
+import { useAction, useConvexAuth, useMutation, useQuery } from "convex/react";
 import { useCallback, useEffect, useState } from "react";
 import type React from "react";
 
 import { api } from "../convex/_generated/api";
 import PasswordManager from "./PasswordManager";
+import AdminPanel, { ROLE_LABELS } from "./components/AdminPanel";
 import { DevVaultResetButton } from "./components/DevVaultResetButton";
+import { errorMessage } from "./errors";
 
 type VaultStatus = "uninitialized" | "initialized";
+
+type Membership =
+  | { state: "checking" }
+  | { state: "ok" }
+  | { state: "denied"; message: string };
 
 const IDLE_LOCK_MS = 5 * 60 * 1000;
 const ACTIVITY_HEARTBEAT_MS = 5 * 1000;
@@ -34,6 +41,19 @@ function App() {
   const [isLockingVault, setIsLockingVault] = useState(false);
   const [isSigningOut, setIsSigningOut] = useState(false);
 
+  const [view, setView] = useState<"vault" | "admin">("vault");
+  const [membership, setMembership] = useState<Membership>({
+    state: "checking",
+  });
+
+  const { isAuthenticated: isConvexAuthenticated } = useConvexAuth();
+  const activateMembership = useAction(api.users.activate);
+  const me = useQuery(
+    api.users.me,
+    isConvexAuthenticated && membership.state === "ok" ? {} : "skip",
+  );
+  const canManageUsers = me?.role === "admin" || me?.role === "manager";
+
   const getSessionToken = useCallback(async (): Promise<string> => {
     if (!isSignedIn) {
       throw new Error("İşlem için Clerk oturumu açılmalı.");
@@ -48,30 +68,69 @@ function App() {
     return token;
   }, [getToken, isSignedIn]);
 
-  const upsertMe = useMutation(api.users.upsertMe);
+  const setPublicKey = useMutation(api.users.setPublicKey);
 
   // Bu cihazdaki kimlik anahtarının açık kısmını Convex'e yazar; diğer
   // kullanıcılar paylaşım yaparken bu anahtarı kullanır.
   async function registerIdentity() {
-    if (!isUserLoaded || !user) {
-      throw new Error("Kullanıcı bilgileri henüz yüklenmedi.");
-    }
-
-    const email = user.primaryEmailAddress?.emailAddress;
-
-    if (!email) {
-      throw new Error("Hesabında bir e-posta adresi bulunamadı.");
-    }
-
-    const displayName =
-      user.fullName?.trim() || user.username?.trim() || email.split("@")[0];
-
     const publicKey = await invoke<string>("get_identity_public_key", {
       sessionToken: await getSessionToken(),
     });
 
-    await upsertMe({ email, displayName, publicKey });
+    await setPublicKey({ publicKey });
   }
+
+  // Clerk hesabını şirket üyeliğine bağlar. Davet edilmemiş ya da devre dışı
+  // bırakılmış hesaplar kasaya ulaşamaz.
+  useEffect(() => {
+    if (!isSignedIn || !isConvexAuthenticated) {
+      setMembership({ state: "checking" });
+      return;
+    }
+
+    let cancelled = false;
+
+    activateMembership()
+      .then(() => {
+        if (!cancelled) setMembership({ state: "ok" });
+      })
+      .catch((error: unknown) => {
+        if (!cancelled) {
+          setMembership({ state: "denied", message: errorMessage(error) });
+        }
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [activateMembership, isConvexAuthenticated, isSignedIn, user?.id]);
+
+  // Kasa açık fakat açık anahtar sunucuda yoksa (ör. kasa önceki bir
+  // oturumdan açık kaldı) anahtarı kaydet; aksi halde paylaşım yapılamaz.
+  const hasPublicKey = me?.hasPublicKey;
+
+  useEffect(() => {
+    if (!isVaultUnlocked || hasPublicKey !== false) {
+      return;
+    }
+
+    registerIdentity().catch((error: unknown) => {
+      console.error("Kimlik anahtarı sunucuya kaydedilemedi:", error);
+      setFormError(
+        `Paylaşım anahtarı sunucuya kaydedilemedi: ${errorMessage(error)}`,
+      );
+    });
+    // registerIdentity her render'da yeniden oluşturulur; yalnızca durum
+    // değiştiğinde çalışması yeterli.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hasPublicKey, isVaultUnlocked]);
+
+  // Kullanıcı yönetim yetkisini kaybederse kasa görünümüne dön.
+  useEffect(() => {
+    if (me && !canManageUsers) {
+      setView("vault");
+    }
+  }, [canManageUsers, me]);
 
   // Local vault status is bound to the currently authenticated Clerk user.
   useEffect(() => {
@@ -275,11 +334,13 @@ function App() {
     };
   }, [getSessionToken, isLoaded, isSignedIn, isVaultUnlocked, user?.id]);
 
-  const isSignUp = window.location.pathname === "/sign-up";
-
   const appearance = {
     theme: dark,
     elements: {
+      // Kayıt yalnızca davetle yapıldığı için "Kayıt ol" bağlantısı gizlenir.
+      footerAction: {
+        display: "none",
+      },
       rootBox: {
         width: "100%",
         maxWidth: "100%",
@@ -512,6 +573,38 @@ function App() {
     );
   }
 
+  if (isSignedIn && membership.state !== "ok") {
+    return (
+      <main className="auth-page">
+        <section className="auth-panel">
+          <div className="auth-brand">
+            <span className="auth-icon">P</span>
+            <span>Password Manager</span>
+          </div>
+
+          {membership.state === "checking" ? (
+            <p>Hesap yetkisi kontrol ediliyor...</p>
+          ) : (
+            <>
+              <p className="vault-form-error" role="alert">
+                {membership.message}
+              </p>
+
+              <button
+                className="vault-primary"
+                type="button"
+                onClick={() => void handleSignOut()}
+                disabled={isSigningOut}
+              >
+                {isSigningOut ? "Oturum kapatılıyor..." : "Oturumu kapat"}
+              </button>
+            </>
+          )}
+        </section>
+      </main>
+    );
+  }
+
   if (isSignedIn) {
     const vaultStatus = vaultStatusError
       ? "Kasa durumu alınamadı"
@@ -532,7 +625,11 @@ function App() {
           </div>
 
           <nav className="vault-nav">
-            <button className="vault-nav-item active" type="button">
+            <button
+              className={`vault-nav-item${view === "vault" ? " active" : ""}`}
+              type="button"
+              onClick={() => setView("vault")}
+            >
               <span>▦</span>
               Tüm kayıtlar
             </button>
@@ -541,7 +638,27 @@ function App() {
               <span>☆</span>
               Favoriler
             </button>
+
+            {canManageUsers && (
+              <button
+                className={`vault-nav-item${view === "admin" ? " active" : ""}`}
+                type="button"
+                onClick={() => setView("admin")}
+              >
+                <span>⚙</span>
+                Kullanıcılar
+              </button>
+            )}
           </nav>
+
+          {me && (
+            <p className="vault-eyebrow" style={{ marginTop: "auto" }}>
+              {me.displayName}
+              <br />
+              {ROLE_LABELS[me.role]}
+              {me.departmentName ? ` · ${me.departmentName}` : ""}
+            </p>
+          )}
 
           <button
             className="vault-logout"
@@ -556,8 +673,10 @@ function App() {
         <section className="vault-content">
           <header className="vault-header">
             <div>
-              <p className="vault-eyebrow">GÜVENLİ KASA</p>
-              <h1>Kasam</h1>
+              <p className="vault-eyebrow">
+                {view === "admin" ? "YÖNETİM" : "GÜVENLİ KASA"}
+              </p>
+              <h1>{view === "admin" ? "Kullanıcılar" : "Kasam"}</h1>
             </div>
 
             <span className="vault-status">
@@ -566,6 +685,9 @@ function App() {
             </span>
           </header>
 
+          {view === "admin" && me ? (
+            <AdminPanel me={me} />
+          ) : (
           <div
             className={
               isVaultInitialized && isVaultUnlocked
@@ -708,6 +830,7 @@ function App() {
               </>
             )}
           </div>
+          )}
 
           <footer className="vault-footer">
             Hesap oturumu ile kasa şifrelemesi birbirinden ayrıdır.
@@ -726,19 +849,15 @@ function App() {
         </div>
 
         <div className="auth-heading">
-          <h1>{isSignUp ? "Hesabını oluştur" : "Tekrar hoş geldin"}</h1>
+          <h1>Tekrar hoş geldin</h1>
           <p>
-            {isSignUp
-              ? "Güvenli kasanı oluşturmak için kayıt ol."
-              : "Güvenli kasana erişmek için giriş yap."}
+            Güvenli kasana erişmek için giriş yap. Hesabın yoksa yöneticinden
+            davet iste.
           </p>
         </div>
 
-        {isSignUp ? (
-          <SignUp routing="hash" signInUrl="/sign-in" appearance={appearance} />
-        ) : (
-          <SignIn routing="hash" signUpUrl="/sign-up" appearance={appearance} />
-        )}
+        {/* Kayıt yalnızca yöneticinin gönderdiği davet bağlantısıyla yapılır. */}
+        <SignIn routing="hash" appearance={appearance} />
 
         <p className="auth-security">
           Hesap doğrulaması ile kasa şifrelemesi birbirinden ayrıdır.
