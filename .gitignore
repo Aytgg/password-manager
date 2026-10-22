@@ -1,0 +1,14 @@
+# Gizli yapılandırma
+.env
+.env.*
+!.env.example
+
+# Bağımlılıklar ve derleme çıktıları
+node_modules/
+dist/
+
+# İşletim sistemi / editör
+.DS_Store
+.vscode/*
+!.vscode/extensions.json
+.idea/
