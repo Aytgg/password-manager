@@ -87,8 +87,6 @@ input {
   border-radius: 11px;
   background: var(--accent);
   color: #18111f;
-  font-size: 19px;
-  font-weight: 800;
 }
 
 .auth-heading {
@@ -157,7 +155,16 @@ input {
   color: var(--text);
 }
 
+/* Sayfa kaydırılırken sidebar ekranın tepesinde sabit kalır. Kendi içeriği
+   ekrana sığmazsa yalnızca sidebar kendi içinde kaydırılır. */
 .vault-sidebar {
+  position: sticky;
+  top: 0;
+  align-self: flex-start;
+  box-sizing: border-box;
+  height: 100vh;
+  height: 100dvh;
+  overflow-y: auto;
   display: flex;
   flex: 0 0 250px;
   flex-direction: column;
@@ -191,6 +198,10 @@ input {
     background 150ms ease,
     color 150ms ease,
     border-color 150ms ease;
+}
+
+.vault-nav-icon {
+  flex-shrink: 0;
 }
 
 .vault-nav-item:hover {
@@ -288,9 +299,9 @@ input {
   margin-bottom: 24px;
   border: 1px solid #3b3151;
   border-radius: 18px;
-  background: #191422;
+  background: linear-gradient(180deg, #221a30 0%, #191422 100%);
+  box-shadow: 0 8px 24px rgb(124 58 237 / 0.18);
   color: #c4b5fd;
-  font-size: 32px;
 }
 
 .vault-empty h2 {
@@ -405,6 +416,15 @@ input {
   margin-top: 0.5rem;
 }
 
+.vault-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+  width: 100%;
+  min-width: 0;
+  margin-top: 24px;
+}
+
 .vault-workspace {
   width: 100%;
   min-width: 0;
@@ -441,10 +461,6 @@ input {
   .vault-nav-item {
     justify-content: center;
     padding: 12px 6px;
-  }
-
-  .vault-nav-item span {
-    font-size: 18px;
   }
 
   .vault-content {

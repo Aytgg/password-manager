@@ -26,7 +26,9 @@ use crate::storage::{
     key_store::PlatformKeyStore,
 };
 use crate::vault::{
-    key_file::{load_protected_master_key, save_protected_master_key},
+    key_file::{
+        load_protected_master_key, replace_protected_master_key, save_protected_master_key,
+    },
     owner_binding::{save_owner_binding, verify_owner_binding},
     items::{self, EncryptedItem, NewItem, Recipient, RekeyedItem, WrappedKeyDto},
     paths::VaultPaths,
@@ -234,6 +236,52 @@ async fn create_vault(
         }
 
         result
+    })
+    .await
+    .map_err(|error| error.to_string())?
+}
+
+/// Ana parolayı değiştirir. Ana anahtar aynı kalır; yalnızca onu koruyan
+/// paroladan türetilmiş anahtar değişir. Bu yüzden Stronghold, kimlik
+/// anahtarı ve sunucudaki şifreli veriler etkilenmez.
+#[tauri::command]
+async fn change_master_password(
+    app: tauri::AppHandle,
+    session_token: String,
+    current_password: String,
+    new_password: String,
+) -> Result<(), String> {
+    let user_id = authenticated_user_id(&session_token)?;
+    let current_password = Zeroizing::new(current_password);
+    let new_password = Zeroizing::new(new_password);
+
+    if current_password.is_empty() {
+        return Err("Mevcut ana parolayı gir.".to_string());
+    }
+
+    validate_new_master_password(&new_password)?;
+
+    if *current_password == *new_password {
+        return Err("Yeni ana parola mevcut paroladan farklı olmalı.".to_string());
+    }
+
+    let paths = VaultPaths::for_user(&app_data_dir(&app)?, &user_id)?;
+
+    tauri::async_runtime::spawn_blocking(move || {
+        if !paths.is_complete() {
+            return Err("Bu hesap için kasa bulunamadı.".to_string());
+        }
+
+        let protected_master_key = load_protected_master_key(&paths.master_key)?;
+
+        let master_key = unlock_master_key(current_password.as_bytes(), &protected_master_key)
+            .map_err(|_| "Mevcut ana parola yanlış.".to_string())?;
+
+        verify_owner_binding(&paths.owner_binding, &master_key, &user_id)?;
+
+        let new_protected = protect_master_key(new_password.as_bytes(), &master_key)?;
+
+        replace_protected_master_key(&paths.master_key, &new_protected)
     })
     .await
     .map_err(|error| error.to_string())?
@@ -486,6 +534,7 @@ pub fn run() {
             touch_vault_activity,
             create_vault,
             unlock_vault,
+            change_master_password,
             vault_reset::reset_vault,
             get_identity_public_key,
             encrypt_new_item,

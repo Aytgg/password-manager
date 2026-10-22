@@ -1,4 +1,4 @@
-import { SignIn, useAuth, useClerk, useUser } from "@clerk/react";
+import { SignIn, UserProfile, useAuth, useClerk, useUser } from "@clerk/react";
 import { dark } from "@clerk/ui/themes";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -10,6 +10,7 @@ import { api } from "../convex/_generated/api";
 import PasswordManager from "./PasswordManager";
 import AdminPanel, { ROLE_LABELS } from "./components/AdminPanel";
 import { DevVaultResetButton } from "./components/DevVaultResetButton";
+import MasterPasswordForm from "./components/MasterPasswordForm";
 import { errorMessage } from "./errors";
 
 type VaultStatus = "uninitialized" | "initialized";
@@ -18,6 +19,46 @@ type Membership =
   | { state: "checking" }
   | { state: "ok" }
   | { state: "denied"; message: string };
+
+function BrandIcon() {
+  return (
+    <span className="auth-icon" aria-hidden="true">
+      <svg
+        width="20"
+        height="20"
+        viewBox="0 0 24 24"
+        fill="none"
+        stroke="currentColor"
+        strokeWidth="2"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+      >
+        <path d="M12 3 4.5 6v5.5c0 4.6 3.1 8.4 7.5 9.5 4.4-1.1 7.5-4.9 7.5-9.5V6Z" />
+        <circle cx="12" cy="11" r="2" />
+        <path d="M12 13v3" />
+      </svg>
+    </span>
+  );
+}
+
+function NavIcon({ children }: { children: React.ReactNode }) {
+  return (
+    <svg
+      className="vault-nav-icon"
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      {children}
+    </svg>
+  );
+}
 
 const IDLE_LOCK_MS = 5 * 60 * 1000;
 const ACTIVITY_HEARTBEAT_MS = 5 * 1000;
@@ -41,7 +82,7 @@ function App() {
   const [isLockingVault, setIsLockingVault] = useState(false);
   const [isSigningOut, setIsSigningOut] = useState(false);
 
-  const [view, setView] = useState<"vault" | "admin">("vault");
+  const [view, setView] = useState<"vault" | "admin" | "settings">("vault");
   const [membership, setMembership] = useState<Membership>({
     state: "checking",
   });
@@ -128,7 +169,7 @@ function App() {
   // Kullanıcı yönetim yetkisini kaybederse kasa görünümüne dön.
   useEffect(() => {
     if (me && !canManageUsers) {
-      setView("vault");
+      setView((current) => (current === "admin" ? "vault" : current));
     }
   }, [canManageUsers, me]);
 
@@ -360,6 +401,20 @@ function App() {
     },
   };
 
+  // Clerk profil kartı sabit 44rem yüksekliktedir; Ayarlar sayfasında boş
+  // alan bırakmaması için yüksekliği içeriğe göre ayarlanır.
+  const profileAppearance = {
+    ...appearance,
+    elements: {
+      ...appearance.elements,
+      cardBox: {
+        ...appearance.elements.cardBox,
+        height: "auto",
+        minHeight: "0",
+      },
+    },
+  };
+
   async function handleCreateVault(
     event: Parameters<NonNullable<React.ComponentProps<"form">["onSubmit"]>>[0],
   ) {
@@ -578,7 +633,7 @@ function App() {
       <main className="auth-page">
         <section className="auth-panel">
           <div className="auth-brand">
-            <span className="auth-icon">P</span>
+            <BrandIcon />
             <span>Password Manager</span>
           </div>
 
@@ -620,7 +675,7 @@ function App() {
       <main className="vault-page">
         <aside className="vault-sidebar">
           <div className="auth-brand">
-            <span className="auth-icon">P</span>
+            <BrandIcon />
             <span>Password Manager</span>
           </div>
 
@@ -630,12 +685,19 @@ function App() {
               type="button"
               onClick={() => setView("vault")}
             >
-              <span>▦</span>
+              <NavIcon>
+                <circle cx="8" cy="15" r="4" />
+                <path d="m10.85 12.15 8.65-8.65" />
+                <path d="m16.5 6.5 2.5 2.5" />
+                <path d="m14 9 2 2" />
+              </NavIcon>
               Tüm kayıtlar
             </button>
 
             <button className="vault-nav-item" type="button">
-              <span>☆</span>
+              <NavIcon>
+                <path d="m12 3.5 2.6 5.3 5.9.85-4.25 4.15 1 5.85L12 16.9l-5.25 2.75 1-5.85L3.5 9.65l5.9-.85Z" />
+              </NavIcon>
               Favoriler
             </button>
 
@@ -645,10 +707,27 @@ function App() {
                 type="button"
                 onClick={() => setView("admin")}
               >
-                <span>⚙</span>
+                <NavIcon>
+                  <circle cx="9" cy="8" r="3.5" />
+                  <path d="M2.5 20a6.5 6.5 0 0 1 13 0" />
+                  <path d="M16 4.6a3.5 3.5 0 0 1 0 6.8" />
+                  <path d="M18.5 14.2A6.5 6.5 0 0 1 21.5 20" />
+                </NavIcon>
                 Kullanıcılar
               </button>
             )}
+
+            <button
+              className={`vault-nav-item${view === "settings" ? " active" : ""}`}
+              type="button"
+              onClick={() => setView("settings")}
+            >
+              <NavIcon>
+                <circle cx="12" cy="12" r="3" />
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" />
+              </NavIcon>
+              Ayarlar
+            </button>
           </nav>
 
           {me && (
@@ -674,9 +753,19 @@ function App() {
           <header className="vault-header">
             <div>
               <p className="vault-eyebrow">
-                {view === "admin" ? "YÖNETİM" : "GÜVENLİ KASA"}
+                {view === "admin"
+                  ? "YÖNETİM"
+                  : view === "settings"
+                    ? "HESAP"
+                    : "GÜVENLİ KASA"}
               </p>
-              <h1>{view === "admin" ? "Kullanıcılar" : "Kasam"}</h1>
+              <h1>
+                {view === "admin"
+                  ? "Kullanıcılar"
+                  : view === "settings"
+                    ? "Ayarlar"
+                    : "Kasam"}
+              </h1>
             </div>
 
             <span className="vault-status">
@@ -687,6 +776,17 @@ function App() {
 
           {view === "admin" && me ? (
             <AdminPanel me={me} />
+          ) : view === "settings" ? (
+            // Hesap şifresi, iki adımlı doğrulama, e-posta ve açık oturumlar
+            // Clerk tarafından yönetilir. Kasa ana parolası bundan bağımsızdır.
+            <div className="vault-settings">
+              <MasterPasswordForm
+                hasVault={isVaultInitialized === true}
+                getSessionToken={getSessionToken}
+              />
+
+              <UserProfile routing="hash" appearance={profileAppearance} />
+            </div>
           ) : (
           <div
             className={
@@ -695,7 +795,24 @@ function App() {
                 : "vault-empty"
             }
           >
-            <div className="vault-empty-icon">⌑</div>
+            {!(isVaultInitialized && isVaultUnlocked) && (
+              <div className="vault-empty-icon" aria-hidden="true">
+                <svg
+                  width="28"
+                  height="28"
+                  viewBox="0 0 24 24"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="1.8"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                >
+                  <rect x="4.5" y="10.5" width="15" height="10" rx="2.5" />
+                  <path d="M8 10.5V7.5a4 4 0 0 1 8 0v3" />
+                  <circle cx="12" cy="15.5" r="1.3" fill="currentColor" stroke="none" />
+                </svg>
+              </div>
+            )}
 
             {vaultStatusError ? (
               <>
@@ -844,7 +961,7 @@ function App() {
     <main className="auth-page">
       <section className="auth-panel">
         <div className="auth-brand">
-          <span className="auth-icon">P</span>
+          <BrandIcon />
           <span>Password Manager</span>
         </div>
 

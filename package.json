@@ -26,6 +26,7 @@
     "vitest": "^5.0.5"
   },
   "dependencies": {
+    "@clerk/localizations": "^4.24.0",
     "@clerk/react": "^6.17.8",
     "@clerk/themes": "^2.4.57",
     "@clerk/ui": "^1.40.0",

@@ -41,6 +41,33 @@ pub fn save_protected_master_key(
     Ok(())
 }
 
+/// Var olan ana anahtar dosyasını yenisiyle değiştirir (ör. ana parola
+/// değişikliği). İçerik önce geçici dosyaya yazılıp diske işlenir, sonra tek
+/// adımda yerine taşınır; yarıda kalan bir yazma eski dosyayı bozmaz.
+pub fn replace_protected_master_key(
+    path: &Path,
+    protected: &ProtectedMasterKey,
+) -> Result<(), String> {
+    if !path.is_file() {
+        return Err("Master key file does not exist".to_string());
+    }
+
+    let temporary_path = path.with_extension(format!("{}.tmp", std::process::id()));
+    let _ = fs::remove_file(&temporary_path);
+
+    if let Err(error) = save_protected_master_key(&temporary_path, protected) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error);
+    }
+
+    if let Err(error) = fs::rename(&temporary_path, path) {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(error.to_string());
+    }
+
+    Ok(())
+}
+
 pub fn load_protected_master_key(path: &Path) -> Result<ProtectedMasterKey, String> {
     let mut file = OpenOptions::new()
         .read(true)
@@ -79,6 +106,45 @@ mod tests {
         assert_eq!(loaded.nonce, protected.nonce);
         assert_eq!(loaded.ciphertext, protected.ciphertext);
         assert_eq!(loaded.kdf_version, protected.kdf_version);
+    }
+
+    #[test]
+    fn master_key_file_can_be_replaced_with_new_password() {
+        use crate::crypto::key_encryption::unlock_master_key;
+
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let path = directory.path().join("master-key.json");
+        let master_key = generate_master_key();
+
+        let old = protect_master_key(b"old-password", &master_key).unwrap();
+        save_protected_master_key(&path, &old).unwrap();
+
+        let new = protect_master_key(b"new-password", &master_key).unwrap();
+        replace_protected_master_key(&path, &new).unwrap();
+
+        let loaded = load_protected_master_key(&path).unwrap();
+
+        assert!(unlock_master_key(b"old-password", &loaded).is_err());
+        assert_eq!(
+            unlock_master_key(b"new-password", &loaded).unwrap().as_ref(),
+            master_key.as_ref()
+        );
+
+        let leftovers: Vec<_> = std::fs::read_dir(directory.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(leftovers, ["master-key.json"]);
+    }
+
+    #[test]
+    fn replacing_requires_an_existing_master_key_file() {
+        let directory = tempfile::tempdir().expect("temporary directory should be created");
+        let path = directory.path().join("master-key.json");
+        let protected = protect_master_key(b"password", &generate_master_key()).unwrap();
+
+        assert!(replace_protected_master_key(&path, &protected).is_err());
+        assert!(!path.exists());
     }
 
     #[test]

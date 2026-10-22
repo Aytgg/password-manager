@@ -792,7 +792,7 @@ export default function PasswordManager({
                     >
                       {copyingPasswordId === item.id
                         ? "Kopyalanıyor..."
-                        : "Use Password"}
+                        : "Copy Password"}
                     </button>
 
                     {item.isOwner && (
