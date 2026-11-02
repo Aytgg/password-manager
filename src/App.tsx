@@ -12,6 +12,7 @@ import AdminPanel, { ROLE_LABELS } from "./components/AdminPanel";
 import { DevVaultResetButton } from "./components/DevVaultResetButton";
 import PasswordChangeForm from "./components/PasswordChangeForm";
 import { errorMessage } from "./errors";
+import { useVaultData } from "./vaultData";
 
 type VaultOwner = { email: string; userId: string };
 
@@ -110,6 +111,21 @@ async function endServerSession(signOut: () => Promise<void>) {
   }
 }
 
+/** Convex WebSocket bağlantısı gerçekten açık mı. Bağlantı koptuğunda
+ * sorgular son değerlerini korur; bu yüzden çevrimiçi durum buradan okunur. */
+function useConnected() {
+  const convex = useConvex();
+  const [connected, setConnected] = useState(() => convex.connectionState().isWebSocketConnected);
+
+  useEffect(
+    () =>
+      convex.subscribeToConnectionState((state) => setConnected(state.isWebSocketConnected)),
+    [convex],
+  );
+
+  return connected;
+}
+
 function App() {
   const { signIn, signOut } = useAuthActions();
   const { isAuthenticated, isLoading: isAuthLoading } = useConvexAuth();
@@ -151,9 +167,18 @@ function App() {
 
   const expectedEmail = vault?.email ?? pendingVaultRef.current?.email ?? null;
   const serverUserMatches = !!me && me.email === expectedEmail;
+  const isConnected = useConnected();
   const isServerReady =
-    !!vault && serverUserMatches && me.id === vault.userId && me.status === "active";
+    isConnected &&
+    !!vault &&
+    serverUserMatches &&
+    me.id === vault.userId &&
+    me.status === "active";
   const canManageUsers = isServerReady && (me.role === "admin" || me.role === "manager");
+
+  // Kayıtların yerel önbelleği ve çevrimdışı kuyruğu; hangi ekran açık olursa
+  // olsun çalışır.
+  const vaultData = useVaultData({ ownerId: vault?.userId ?? null, isOnline: isServerReady });
 
   // Kasa hangi yoldan kilitlenirse kilitlensin (buton, hareketsizlik, hata)
   // sunucu oturumu da kapatılır; kilitliyken cihazda geçerli token kalmaz.
@@ -763,7 +788,7 @@ function App() {
           </div>
         ) : (
           <div className="vault-workspace">
-            <PasswordManager key={vault.userId} isServerReady={isServerReady} />
+            <PasswordManager key={vault.userId} data={vaultData} isOnline={isServerReady} />
 
             {formError && (
               <p className="vault-form-error" role="alert">

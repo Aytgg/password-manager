@@ -556,6 +556,41 @@ describe("kişiye paylaşım ve rekey", () => {
     expect(leftovers).toEqual([0, 0, 0]);
   });
 
+  test("listede paylaşım kuralları yalnız sahibe gelir; dizin kişileri ve departmanları verir", async () => {
+    const { ids, uid, as, createItem, shareWithUser } = await setup();
+    const id = await createItem("alice");
+    await shareWithUser("alice", id, uid("carol"));
+    await as("alice").mutation(api.items.setDepartmentGrant, {
+      id,
+      departmentId: ids.satis,
+      granted: true,
+    });
+
+    const [own] = await as("alice").query(api.items.listMine, {});
+    expect(own.grants).toEqual({ userIds: [uid("carol")], departmentIds: [ids.satis] });
+
+    const [shared] = await as("carol").query(api.items.listMine, {});
+    expect(shared.grants).toBeNull();
+
+    const directory = await as("alice").query(api.items.shareDirectory, {});
+    expect(directory.departments.map((d) => d.id).sort()).toEqual([ids.satis, ids.yazilim].sort());
+    expect(directory.users.map((u) => u.userId)).not.toContain(uid("alice"));
+  });
+
+  test("aynı kayıt kimliği tekrar gönderilirse mevcut kayıt döner", async () => {
+    const { as } = await setup();
+    const payload = {
+      itemId: newItemId(),
+      metadata: sealed(1),
+      secret: sealed(2),
+      ownerAccess: wrapped(1),
+    };
+
+    const first = await as("alice").mutation(api.items.create, payload);
+    expect(await as("alice").mutation(api.items.create, payload)).toBe(first);
+    await expect(as("bob").mutation(api.items.create, payload)).rejects.toThrow(/zaten kullanılıyor/);
+  });
+
   test("rekey beklerken eski anahtar dağıtılmaz", async () => {
     const { uid, as, createItem, shareWithUser } = await setup();
     const id = await createItem("alice");

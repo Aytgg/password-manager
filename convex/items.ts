@@ -73,7 +73,12 @@ type KeyPath =
       itemKey: Doc<"itemDepartmentAccess">["access"];
     };
 
-function serialize(item: Doc<"items">, access: KeyPath, userId: Id<"users">) {
+function serialize(
+  item: Doc<"items">,
+  access: KeyPath,
+  userId: Id<"users">,
+  grants: { userIds: Id<"users">[]; departmentIds: Id<"departments">[] } | null = null,
+) {
   return {
     id: item._id,
     itemId: item.itemId,
@@ -85,7 +90,18 @@ function serialize(item: Doc<"items">, access: KeyPath, userId: Id<"users">) {
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
     access,
+    // Yalnızca sahibe: paylaşım paneli çevrimdışıyken bundan çalışır.
+    grants,
   };
+}
+
+async function ownerGrants(ctx: QueryCtx, item: Doc<"items">, userId: Id<"users">) {
+  if (item.ownerId !== userId) {
+    return null;
+  }
+
+  const { userIds, departmentIds } = await itemGrants(ctx, item._id);
+  return { userIds: [...userIds], departmentIds: [...departmentIds] };
 }
 
 /**
@@ -105,7 +121,15 @@ export const listMine = query({
       const item = await ctx.db.get(access.item);
 
       if (item) {
-        results.set(item._id, serialize(item, { kind: "direct", access: access.access }, user._id));
+        results.set(
+          item._id,
+          serialize(
+            item,
+            { kind: "direct", access: access.access },
+            user._id,
+            await ownerGrants(ctx, item, user._id),
+          ),
+        );
       }
     }
 
@@ -168,6 +192,12 @@ export const create = mutation({
       .unique();
 
     if (duplicate) {
+      // Çevrimdışı kuyruktan tekrar gönderilen kayıt (önceki yanıt
+      // kaybolmuş olabilir).
+      if (duplicate.ownerId === user._id) {
+        return duplicate._id;
+      }
+
       throw new ConvexError("Bu kayıt kimliği zaten kullanılıyor.");
     }
 
@@ -214,6 +244,39 @@ export const remove = mutation({
     }
 
     await ctx.db.delete(item._id);
+  },
+});
+
+/**
+ * Paylaşım yapılabilecek departmanlar ve kişiler. İstemci önbelleğe alır;
+ * böylece yetkilendirme çevrimdışıyken de yapılıp sonra gönderilebilir.
+ */
+export const shareDirectory = query({
+  args: {},
+  handler: async (ctx) => {
+    const user = await requireActiveUser(ctx);
+
+    const departments = await ctx.db.query("departments").collect();
+    const departmentNames = new Map(departments.map((d) => [d._id, d.name]));
+
+    return {
+      departments: departments
+        .map((department) => ({ id: department._id, name: department.name }))
+        .sort((a, b) => a.name.localeCompare(b.name, "tr")),
+      users: (await ctx.db.query("users").collect())
+        .filter((candidate) => candidate.status !== "disabled" && candidate._id !== user._id)
+        .map((candidate) => ({
+          userId: candidate._id,
+          email: candidate.email,
+          displayName: candidate.displayName ?? candidate.email,
+          status: candidate.status,
+          departmentId: candidate.departmentId ?? null,
+          departmentName: candidate.departmentId
+            ? (departmentNames.get(candidate.departmentId) ?? null)
+            : null,
+        }))
+        .sort((a, b) => a.displayName.localeCompare(b.displayName, "tr")),
+    };
   },
 });
 

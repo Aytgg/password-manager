@@ -6,7 +6,7 @@ use std::{
 use crate::{
     crypto::{identity::IdentityKeyPair, key_encryption::ProtectedMasterKey},
     storage::key_store::PlatformKeyStore,
-    vault::owner_binding::VaultOwner,
+    vault::{cache::CacheKey, owner_binding::VaultOwner},
 };
 
 pub const AUTO_LOCK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
@@ -15,6 +15,7 @@ struct UnlockedVault {
     identity: IdentityKeyPair,
     key_store: PlatformKeyStore,
     owner: VaultOwner,
+    cache_key: CacheKey,
     last_activity: Instant,
     /// Sunucu parolayı onaylayana kadar diske yazılmayan yeni ana anahtar
     /// koruması (parola değişikliği).
@@ -102,6 +103,7 @@ impl VaultSession {
         identity: IdentityKeyPair,
         key_store: PlatformKeyStore,
         owner: VaultOwner,
+        cache_key: CacheKey,
     ) -> Result<(), String> {
         let mut guard = self.guard()?;
 
@@ -112,6 +114,7 @@ impl VaultSession {
             identity,
             key_store,
             owner,
+            cache_key,
             last_activity: Instant::now(),
             pending_master_key: None,
         });
@@ -162,6 +165,22 @@ impl VaultSession {
         operation(&unlocked.identity, &unlocked.owner, &unlocked.key_store)
     }
 
+    /// Kasa açıksa yerel önbellek anahtarıyla işlem yapar.
+    pub fn with_cache_key<T>(
+        &self,
+        operation: impl FnOnce(&VaultOwner, &CacheKey) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut guard = self.guard()?;
+
+        if Self::expire_if_needed(&mut guard, self.idle_timeout)? {
+            return Err("Kasa hareketsizlik nedeniyle kilitlendi.".to_string());
+        }
+
+        let unlocked = guard.as_ref().ok_or_else(|| "Kasa kilitli.".to_string())?;
+
+        operation(&unlocked.owner, &unlocked.cache_key)
+    }
+
     pub fn set_pending_master_key(&self, protected: ProtectedMasterKey) -> Result<(), String> {
         let mut guard = self.guard()?;
         let unlocked = guard.as_mut().ok_or_else(|| "Kasa kilitli.".to_string())?;
@@ -199,7 +218,12 @@ mod tests {
         let session = VaultSession::with_idle_timeout(idle_timeout);
 
         session
-            .unlock(IdentityKeyPair::generate(), PlatformKeyStore::new(), owner(email))
+            .unlock(
+                IdentityKeyPair::generate(),
+                PlatformKeyStore::new(),
+                owner(email),
+                zeroize::Zeroizing::new([0u8; 32]),
+            )
             .expect("session should unlock");
 
         session
@@ -242,7 +266,12 @@ mod tests {
         let session = create_unlocked_session(Duration::from_secs(30), "a@x.com");
 
         session
-            .unlock(IdentityKeyPair::generate(), PlatformKeyStore::new(), owner("b@x.com"))
+            .unlock(
+                IdentityKeyPair::generate(),
+                PlatformKeyStore::new(),
+                owner("b@x.com"),
+                zeroize::Zeroizing::new([0u8; 32]),
+            )
             .unwrap();
 
         assert_eq!(session.current_owner().unwrap(), Some(owner("b@x.com")));

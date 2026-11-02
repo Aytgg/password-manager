@@ -1,14 +1,19 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type React from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useConvex, useMutation, useQuery } from "convex/react";
-import type { FunctionReturnType } from "convex/server";
 
 import { api } from "../convex/_generated/api";
 import type { Id } from "../convex/_generated/dataModel";
 import { errorMessage } from "./errors";
-
-type ServerItem = FunctionReturnType<typeof api.items.listMine>[number];
+import {
+  toEncryptedItem,
+  type GrantTarget,
+  type NewItem,
+  type QueuedOp,
+  type VaultData,
+  type VaultItem,
+} from "./vaultData";
 
 type SealedField = { nonce: string; ciphertext: string };
 
@@ -16,23 +21,6 @@ type WrappedKey = {
   ephemeralPublicKey: string;
   nonce: string;
   ciphertext: string;
-};
-
-// Rust tarafındaki `EncryptedItem`; `access` doğrudan ya da departman
-// anahtarı üzerinden DEK'e ulaşma yoludur.
-type EncryptedItem = {
-  itemId: string;
-  ownerId: string;
-  metadata: SealedField;
-  secret: SealedField;
-  access: ServerItem["access"];
-};
-
-type NewItem = {
-  itemId: string;
-  metadata: SealedField;
-  secret: SealedField;
-  ownerAccess: WrappedKey;
 };
 
 type DecryptedMetadata = {
@@ -43,29 +31,18 @@ type DecryptedMetadata = {
 };
 
 type PasswordItem = {
-  id: Id<"items">;
+  vault: VaultItem;
   title: string;
   username: string | null;
   /** Başlık ve kullanıcı adı çözüldü; düzenleme ancak o zaman açılır. */
   decrypted: boolean;
-  isOwner: boolean;
-  server: ServerItem;
 };
 
 type PasswordManagerProps = {
-  /** Sunucu oturumu açık ve kasanın sahibiyle eşleşiyor. */
-  isServerReady: boolean;
+  data: VaultData;
+  /** Sunucuya bağlı ve oturum kasanın sahibiyle eşleşiyor. */
+  isOnline: boolean;
 };
-
-function toEncryptedItem(item: ServerItem): EncryptedItem {
-  return {
-    itemId: item.itemId,
-    ownerId: item.ownerId,
-    metadata: item.metadata,
-    secret: item.secret,
-    access: item.access,
-  };
-}
 
 const styles: Record<string, React.CSSProperties> = {
   page: {
@@ -200,103 +177,101 @@ function Toggle({
 }
 
 /**
- * Bir parolanın departman ve kişi bazındaki paylaşım kuralları. Değişiklikler
- * hemen uygulanır; anahtar dağıtımı ve erişim kaldırıldığında yeniden
- * şifreleme arka planda otomatik yapılır.
+ * Bir parolanın departman ve kişi bazındaki paylaşım kuralları. Çevrimdışıyken
+ * de değiştirilebilir: değişiklik kuyruğa alınır ve bağlantı gelince
+ * gönderilir. Anahtar dağıtımı ve erişim kaldırıldığında yeniden şifreleme
+ * arka planda otomatik yapılır.
  */
-function SharingPanel({ id }: { id: Id<"items"> }) {
-  const sharing = useQuery(api.items.sharing, { id });
-  const setUserGrant = useMutation(api.items.setUserGrant);
-  const setDepartmentGrant = useMutation(api.items.setDepartmentGrant);
+function SharingPanel({
+  item,
+  data,
+  isOnline,
+}: {
+  item: VaultItem;
+  data: VaultData;
+  isOnline: boolean;
+}) {
+  // Anahtar durumu (erişim açık mı, hazırlanıyor mu) yalnızca sunucudan
+  // öğrenilebilir.
+  const live = useQuery(api.items.sharing, isOnline && item.id ? { id: item.id } : "skip");
+  const keyStatus = new Map(live?.users.map((user) => [user.userId, user.hasKey]) ?? []);
 
-  const [busyKey, setBusyKey] = useState<string | null>(null);
-  const [error, setError] = useState("");
-  const [notice, setNotice] = useState("");
+  const directory = data.directory;
+  const grants = item.grants ?? { userIds: [], departmentIds: [] };
 
-  async function update(key: string, granted: boolean, task: () => Promise<unknown>) {
-    if (busyKey) return;
+  const toggle = (target: GrantTarget, granted: boolean) =>
+    data.setGrant(item.itemId, target, granted);
 
-    setBusyKey(key);
-    setError("");
-    setNotice("");
-
-    try {
-      await task();
-
-      if (!granted) {
-        setNotice(
-          "Erişim kaldırıldı; parola yeni bir anahtarla yeniden şifreleniyor. Kaldırılan kişi parolayı daha önce görmüş olabilir; gerekirse parolanın kendisini değiştir.",
-        );
-      }
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setBusyKey(null);
-    }
-  }
-
-  if (sharing === undefined) {
-    return <p style={styles.muted}>Erişim listesi yükleniyor...</p>;
+  if (!directory) {
+    return (
+      <p style={styles.muted}>
+        Kişi ve departman listesi henüz bu cihaza indirilmedi; bir kez çevrimiçi olunca
+        çevrimdışı da yetkilendirme yapabilirsin.
+      </p>
+    );
   }
 
   return (
     <div>
-      {error && (
-        <p role="alert" style={styles.error}>
-          {error}
+      {item.pendingSync && (
+        <p role="status" style={{ ...styles.muted, fontSize: 13, color: "#fbbf24" }}>
+          {isOnline
+            ? "Değişiklikler sunucuya gönderiliyor..."
+            : "Çevrimdışısın; değişiklikler bağlantı gelince uygulanacak. Erişimi kaldırılan kişi o zamana kadar kendi cihazındaki kopyayı görmeye devam edebilir."}
         </p>
       )}
-      {notice && (
-        <p role="status" style={{ ...styles.muted, fontSize: 13 }}>
-          {notice}
-        </p>
-      )}
+
+      <p style={{ ...styles.muted, fontSize: 13 }}>
+        Erişim kaldırıldığında parola yeni bir anahtarla yeniden şifrelenir. Kaldırılan kişi
+        parolayı daha önce görmüş olabilir; gerekirse parolanın kendisini değiştir.
+      </p>
 
       <h4 style={{ marginTop: 0, marginBottom: 4 }}>Departmanlar</h4>
       <p style={{ ...styles.muted, fontSize: 13, marginTop: 0 }}>
         Departmana verilen erişim, departmana sonradan katılanları da kapsar.
       </p>
 
-      {sharing.departments.length === 0 ? (
+      {directory.departments.length === 0 ? (
         <p style={styles.muted}>Henüz departman tanımlanmamış.</p>
       ) : (
-        sharing.departments.map((department) => {
-          const key = `department:${department.id}`;
-
-          return (
-            <div key={department.id} style={styles.accessRow}>
-              <div>{department.name}</div>
-              <Toggle
-                checked={department.granted}
-                disabled={busyKey !== null}
-                label={`${department.name} departmanı için parola erişimi`}
-                onChange={(granted) =>
-                  void update(key, granted, () =>
-                    setDepartmentGrant({ id, departmentId: department.id, granted }),
-                  )
-                }
-              />
-            </div>
-          );
-        })
+        directory.departments.map((department) => (
+          <div key={department.id} style={styles.accessRow}>
+            <div>{department.name}</div>
+            <Toggle
+              checked={grants.departmentIds.includes(department.id)}
+              disabled={false}
+              label={`${department.name} departmanı için parola erişimi`}
+              onChange={(granted) =>
+                toggle({ kind: "department", departmentId: department.id }, granted)
+              }
+            />
+          </div>
+        ))
       )}
 
       <h4 style={{ marginTop: 20, marginBottom: 4 }}>Kişiler</h4>
 
-      {sharing.users.length === 0 ? (
+      {directory.users.length === 0 ? (
         <p style={styles.muted}>Yetkilendirilebilecek başka kullanıcı yok.</p>
       ) : (
-        sharing.users.map((user) => {
-          const key = `user:${user.userId}`;
-          const allowed = user.direct || user.viaDepartment;
+        directory.users.map((user) => {
+          const direct = grants.userIds.includes(user.userId);
+          const viaDepartment =
+            user.departmentId !== null && grants.departmentIds.includes(user.departmentId);
+          const allowed = direct || viaDepartment;
+          const hasKey = keyStatus.get(user.userId);
 
-          const access = user.hasKey
-            ? user.direct
-              ? "Erişim açık"
-              : "Departman üzerinden erişim açık"
-            : allowed
-              ? "Anahtar hazırlanıyor..."
-              : "Erişim kapalı";
+          const access = !allowed
+            ? "Erişim kapalı"
+            : hasKey === undefined || item.pendingSync
+              ? direct
+                ? "Erişim verildi"
+                : "Departman üzerinden erişim verildi"
+              : hasKey
+                ? direct
+                  ? "Erişim açık"
+                  : "Departman üzerinden erişim açık"
+                : "Anahtar hazırlanıyor...";
 
           // Davet edilen kişi henüz kaydolmamış olsa da paylaşım yapılabilir;
           // kaydolduğunda kimsenin çevrimiçi olması gerekmeden erişir.
@@ -319,7 +294,7 @@ function SharingPanel({ id }: { id: Id<"items"> }) {
                 </div>
                 <div
                   style={{
-                    color: user.hasKey ? "#4ade80" : allowed ? "#fbbf24" : "#9ca3af",
+                    color: hasKey && allowed ? "#4ade80" : allowed ? "#fbbf24" : "#9ca3af",
                     fontSize: 12,
                     marginTop: 4,
                   }}
@@ -329,14 +304,10 @@ function SharingPanel({ id }: { id: Id<"items"> }) {
               </div>
 
               <Toggle
-                checked={user.direct}
-                disabled={busyKey !== null}
+                checked={direct}
+                disabled={false}
                 label={`${user.displayName} için doğrudan parola erişimi`}
-                onChange={(granted) =>
-                  void update(key, granted, () =>
-                    setUserGrant({ id, userId: user.userId, granted }),
-                  )
-                }
+                onChange={(granted) => toggle({ kind: "user", userId: user.userId }, granted)}
               />
             </div>
           );
@@ -365,7 +336,7 @@ function EditItemForm({
   onSaved,
   onDeleted,
 }: {
-  item: PasswordItem;
+  item: { id: Id<"items">; title: string; username: string | null };
   onCancel: () => void;
   onSaved: () => void;
   onDeleted: () => void;
@@ -524,20 +495,83 @@ function EditItemForm({
   );
 }
 
-export default function PasswordManager({ isServerReady: isReady }: PasswordManagerProps) {
-  // Convex sorguları canlıdır; sunucudaki değişiklikler otomatik gelir.
-  const serverItems = useQuery(api.items.listMine, isReady ? {} : "skip");
-  const pendingSharedCount = useQuery(
-    api.items.pendingSharedCount,
-    isReady ? {} : "skip",
-  );
+/**
+ * Çevrimdışıyken yapılıp sunucuya gönderilmeyi bekleyen işlemler; bağlantı
+ * gelince listedeki sırayla gönderilir.
+ */
+function PendingOperations({
+  queue,
+  directory,
+  titleOf,
+  isOnline,
+}: {
+  queue: QueuedOp[];
+  directory: VaultData["directory"];
+  titleOf: (itemId: string) => string;
+  isOnline: boolean;
+}) {
+  const targetName = (target: GrantTarget) =>
+    target.kind === "user"
+      ? (directory?.users.find((user) => user.userId === target.userId)?.displayName ??
+        "bilinmeyen kişi")
+      : `${directory?.departments.find((d) => d.id === target.departmentId)?.name ?? "bilinmeyen"} departmanı`;
 
-  const createItem = useMutation(api.items.create);
+  const describe = (op: QueuedOp) =>
+    op.kind === "create"
+      ? `Yeni kayıt: ${titleOf(op.item.itemId)}`
+      : `${op.granted ? "Yetki verildi" : "Yetki kaldırıldı"}: ${titleOf(op.itemId)} → ${targetName(op.target)}`;
+
+  return (
+    <details
+      open
+      style={{
+        marginBottom: 16,
+        padding: 12,
+        background: "#292419",
+        border: "1px solid #66512b",
+        borderRadius: 9,
+        color: "#fbbf24",
+        fontSize: 13,
+      }}
+    >
+      <summary style={{ cursor: "pointer", fontWeight: 600 }}>
+        Bekleyen {queue.length} işlem
+      </summary>
+
+      <p style={{ margin: "8px 0", color: "#d6c08f" }}>
+        {isOnline
+          ? "Sunucuya gönderiliyor..."
+          : "Bu cihazda yapıldı; bağlantı gelince sırayla sunucuya gönderilecek."}
+      </p>
+
+      <ol style={{ margin: 0, paddingLeft: 20, color: "#e5e7eb" }}>
+        {queue.map((op, index) => (
+          <li key={index} style={{ padding: "2px 0", overflowWrap: "anywhere" }}>
+            {describe(op)}
+          </li>
+        ))}
+      </ol>
+    </details>
+  );
+}
+
+function formatSyncedAt(timestamp: number | null) {
+  if (timestamp === null) return "hiç";
+
+  return new Date(timestamp).toLocaleString("tr-TR", {
+    day: "numeric",
+    month: "long",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
+export default function PasswordManager({ data, isOnline }: PasswordManagerProps) {
+  const pendingSharedCount = useQuery(api.items.pendingSharedCount, isOnline ? {} : "skip");
 
   const [metadataByItemId, setMetadataByItemId] = useState<
     Record<string, DecryptedMetadata>
   >({});
-  const [decryptVersion, setDecryptVersion] = useState(0);
 
   const [title, setTitle] = useState("");
   const [username, setUsername] = useState("");
@@ -553,84 +587,61 @@ export default function PasswordManager({ isServerReady: isReady }: PasswordMana
 
   // Bir kartta aynı anda tek panel açık olur: yetkilendirme ya da düzenleme.
   const [openPanel, setOpenPanel] = useState<{
-    id: Id<"items">;
+    itemId: string;
     kind: "sharing" | "edit";
   } | null>(null);
 
-  const togglePanel = (id: Id<"items">, kind: "sharing" | "edit") =>
+  const togglePanel = (itemId: string, kind: "sharing" | "edit") =>
     setOpenPanel((current) =>
-      current?.id === id && current.kind === kind ? null : { id, kind },
+      current?.itemId === itemId && current.kind === kind ? null : { itemId, kind },
     );
 
   // Başlık ve kullanıcı adı şifreli geldiği için liste her değiştiğinde
   // meta veri Rust tarafında çözülür. Parolaların kendisi çözülmez.
   useEffect(() => {
-    if (!isReady || !serverItems) {
-      setMetadataByItemId({});
-      return;
-    }
-
     let cancelled = false;
 
-    async function decryptMetadata() {
-      try {
-        const result = await invoke<DecryptedMetadata[]>(
-          "decrypt_items_metadata",
-          {
-            items: serverItems!.map(toEncryptedItem),
-          },
-        );
-
+    invoke<DecryptedMetadata[]>("decrypt_items_metadata", {
+      items: data.items.map((item) => item.encrypted),
+    })
+      .then((result) => {
         if (!cancelled) {
-          setMetadataByItemId(
-            Object.fromEntries(result.map((entry) => [entry.itemId, entry])),
-          );
+          setMetadataByItemId(Object.fromEntries(result.map((entry) => [entry.itemId, entry])));
         }
-      } catch (err) {
-        if (!cancelled) {
-          setError(errorMessage(err));
-        }
-      }
-    }
-
-    void decryptMetadata();
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) setError(errorMessage(err));
+      });
 
     return () => {
       cancelled = true;
     };
-  }, [decryptVersion, isReady, serverItems]);
+  }, [data.items]);
 
-  const items = useMemo<PasswordItem[]>(() => {
-    if (!serverItems) {
-      return [];
-    }
+  const items = useMemo<PasswordItem[]>(
+    () =>
+      data.items
+        .map((item) => {
+          const metadata = metadataByItemId[item.itemId];
 
-    return serverItems
-      .map((item) => {
-        const metadata = metadataByItemId[item.itemId];
+          return {
+            vault: item,
+            title: metadata?.title ?? (metadata?.error ? "Çözülemedi" : "…"),
+            username: metadata?.username ?? null,
+            decrypted: typeof metadata?.title === "string",
+          };
+        })
+        .sort(
+          (a, b) =>
+            a.title.localeCompare(b.title, "tr", { sensitivity: "base" }) ||
+            a.vault.itemId.localeCompare(b.vault.itemId),
+        ),
+    [data.items, metadataByItemId],
+  );
 
-        return {
-          id: item.id,
-          title: metadata?.title ?? (metadata?.error ? "Çözülemedi" : "…"),
-          username: metadata?.username ?? null,
-          decrypted: typeof metadata?.title === "string",
-          isOwner: item.isOwner,
-          server: item,
-        };
-      })
-      .sort(
-        (a, b) =>
-          a.title.localeCompare(b.title, "tr", { sensitivity: "base" }) ||
-          a.id.localeCompare(b.id),
-      );
-  }, [metadataByItemId, serverItems]);
-
-  const refreshPasswords = useCallback(() => {
-    setError("");
-    setDecryptVersion((version) => version + 1);
-  }, []);
-
-  async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
+  async function handleSubmit(
+    event: Parameters<NonNullable<React.ComponentProps<"form">["onSubmit"]>>[0],
+  ) {
     event.preventDefault();
 
     if (!title.trim() || !password) {
@@ -644,19 +655,24 @@ export default function PasswordManager({ isServerReady: isReady }: PasswordMana
 
     try {
       // Şifreleme Rust'ta yapılır; Convex'e yalnızca şifreli veri gider.
+      // Kayıt önce bu cihazda kuyruğa alınır, bağlantı varsa hemen gönderilir.
       const encrypted = await invoke<NewItem>("encrypt_new_item", {
         title: title.trim(),
         username: username.trim() || null,
         password,
       });
 
-      await createItem(encrypted);
+      data.addItem(encrypted);
 
       setTitle("");
       setUsername("");
       setPassword("");
 
-      setSuccess("Parola şifrelenerek kasaya kaydedildi.");
+      setSuccess(
+        isOnline
+          ? "Parola şifrelenerek kasaya kaydedildi."
+          : "Parola bu cihazda şifrelenerek kaydedildi; bağlantı gelince sunucuya gönderilecek.",
+      );
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -669,14 +685,12 @@ export default function PasswordManager({ isServerReady: isReady }: PasswordMana
       return;
     }
 
-    setCopyingPasswordId(item.id);
+    setCopyingPasswordId(item.vault.itemId);
     setError("");
     setSuccess("");
 
     try {
-      await invoke("copy_item_password_to_clipboard", {
-        item: toEncryptedItem(item.server),
-      });
+      await invoke("copy_item_password_to_clipboard", { item: item.vault.encrypted });
 
       setSuccess(
         "Parola panoya kopyalandı. 30 saniye sonra otomatik temizlenmesi denenecek.",
@@ -688,11 +702,6 @@ export default function PasswordManager({ isServerReady: isReady }: PasswordMana
     }
   }
 
-  // Çevrimdışı erişim (yerel şifreli önbellek) bir sonraki adımda eklenecek.
-  if (!isReady) {
-    return <section style={styles.page}>Sunucu bağlantısı bekleniyor...</section>;
-  }
-
   return (
     <section style={styles.page}>
       <h2 style={{ marginTop: 0 }}>Parola kasası</h2>
@@ -700,6 +709,39 @@ export default function PasswordManager({ isServerReady: isReady }: PasswordMana
       <p style={styles.muted}>
         Parolalar bu cihazda şifrelenir; sunucuya yalnızca şifreli veri gönderilir.
       </p>
+
+      {!isOnline && (
+        <p
+          role="status"
+          style={{
+            padding: 12,
+            background: "#1e2433",
+            border: "1px solid #353b48",
+            borderRadius: 9,
+            fontSize: 13,
+          }}
+        >
+          Çevrimdışısın; liste bu cihazdaki kopyadan gösteriliyor (son eşitleme:{" "}
+          {formatSyncedAt(data.syncedAt)}). Parolaları görüntüleyip kopyalayabilir, yeni
+          kayıt ekleyebilir ve yetkilendirme yapabilirsin. Düzenleme ve silme için bağlantı
+          gerekli.
+        </p>
+      )}
+
+      {data.queue.length > 0 && (
+        <PendingOperations
+          queue={data.queue}
+          directory={data.directory}
+          titleOf={(itemId) => metadataByItemId[itemId]?.title ?? "Adı çözülemeyen kayıt"}
+          isOnline={isOnline}
+        />
+      )}
+
+      {data.errors.map((message) => (
+        <p key={message} role="alert" style={styles.error}>
+          {message}
+        </p>
+      ))}
 
       <form onSubmit={handleSubmit}>
         <label htmlFor="password-title">Başlık</label>
@@ -738,7 +780,7 @@ export default function PasswordManager({ isServerReady: isReady }: PasswordMana
             opacity: loading ? 0.6 : 1,
           }}
           type="submit"
-          disabled={loading}
+          disabled={loading || !data.loaded}
         >
           {loading ? "Kaydediliyor..." : "Parolayı kaydet"}
         </button>
@@ -756,28 +798,9 @@ export default function PasswordManager({ isServerReady: isReady }: PasswordMana
         </p>
       )}
 
-      <div
-        style={{
-          display: "flex",
-          justifyContent: "space-between",
-          alignItems: "center",
-          gap: 12,
-          flexWrap: "wrap",
-          marginTop: 32,
-        }}
-      >
-        <h3 style={{ margin: 0 }}>Kayıtlı parolalar ({items.length})</h3>
+      <h3 style={{ marginTop: 32, marginBottom: 0 }}>Kayıtlı parolalar ({items.length})</h3>
 
-        <button
-          type="button"
-          style={styles.secondaryButton}
-          onClick={refreshPasswords}
-        >
-          Yenile
-        </button>
-      </div>
-
-      {pendingSharedCount !== undefined && pendingSharedCount > 0 && (
+      {isOnline && pendingSharedCount !== undefined && pendingSharedCount > 0 && (
         <p
           role="status"
           style={{
@@ -796,19 +819,25 @@ export default function PasswordManager({ isServerReady: isReady }: PasswordMana
         </p>
       )}
 
-      {serverItems === undefined ? (
+      {!data.loaded ? (
         <p style={styles.muted}>Parolalar yükleniyor...</p>
       ) : items.length === 0 ? (
-        <p style={styles.muted}>Henüz erişimin olan bir parola yok.</p>
+        <p style={styles.muted}>
+          {isOnline || data.syncedAt !== null
+            ? "Henüz erişimin olan bir parola yok."
+            : "Bu cihazda henüz eşitlenmiş parola yok; bir kez çevrimiçi olunca çevrimdışı da erişebilirsin."}
+        </p>
       ) : (
         <div style={{ display: "grid", gap: 12, marginTop: 16 }}>
           {items.map((item) => {
+            const { itemId, id, isOwner } = item.vault;
             const isAuthorizationOpen =
-              openPanel?.id === item.id && openPanel.kind === "sharing";
-            const isEditOpen = openPanel?.id === item.id && openPanel.kind === "edit";
+              openPanel?.itemId === itemId && openPanel.kind === "sharing";
+            const canEdit = isOnline && id !== null && item.decrypted;
+            const isEditOpen = canEdit && openPanel?.itemId === itemId && openPanel.kind === "edit";
 
             return (
-              <article key={item.id} style={styles.card}>
+              <article key={itemId} style={styles.card}>
                 <div
                   style={{
                     display: "flex",
@@ -825,15 +854,17 @@ export default function PasswordManager({ isServerReady: isReady }: PasswordMana
                       {item.username || "Kullanıcı adı belirtilmemiş"}
                     </p>
 
-                    {!item.isOwner && (
-                      <p
-                        style={{
-                          color: "#a5b4fc",
-                          fontSize: 12,
-                          marginBottom: 0,
-                        }}
-                      >
+                    {!isOwner && (
+                      <p style={{ color: "#a5b4fc", fontSize: 12, marginBottom: 0 }}>
                         Seninle paylaşılmış
+                      </p>
+                    )}
+
+                    {item.vault.pendingSync && (
+                      <p style={{ color: "#fbbf24", fontSize: 12, marginBottom: 0 }}>
+                        {id === null
+                          ? "Sunucuya gönderilmeyi bekliyor"
+                          : "Paylaşım değişikliği gönderilmeyi bekliyor"}
                       </p>
                     )}
                   </div>
@@ -855,36 +886,34 @@ export default function PasswordManager({ isServerReady: isReady }: PasswordMana
                       onClick={() => void handleCopyPassword(item)}
                       disabled={copyingPasswordId !== null}
                     >
-                      {copyingPasswordId === item.id
-                        ? "Kopyalanıyor..."
-                        : "Copy Password"}
+                      {copyingPasswordId === itemId ? "Kopyalanıyor..." : "Parolayı kopyala"}
                     </button>
 
-                    {item.isOwner && (
+                    {isOwner && (
                       <button
                         type="button"
                         style={{
                           ...styles.secondaryButton,
                           background: isEditOpen ? "#4b5563" : styles.secondaryButton.background,
+                          opacity: canEdit ? 1 : 0.5,
                         }}
-                        onClick={() => togglePanel(item.id, "edit")}
-                        disabled={!item.decrypted}
+                        onClick={() => togglePanel(itemId, "edit")}
+                        disabled={!canEdit}
+                        title={isOnline ? undefined : "Düzenleme ve silme için bağlantı gerekli"}
                         aria-expanded={isEditOpen}
                       >
                         Düzenle
                       </button>
                     )}
 
-                    {item.isOwner && (
+                    {isOwner && (
                       <button
                         type="button"
                         style={{
                           ...styles.button,
-                          background: isAuthorizationOpen
-                            ? "#4b5563"
-                            : "#6366f1",
+                          background: isAuthorizationOpen ? "#4b5563" : "#6366f1",
                         }}
-                        onClick={() => togglePanel(item.id, "sharing")}
+                        onClick={() => togglePanel(itemId, "sharing")}
                         aria-expanded={isAuthorizationOpen}
                       >
                         Yetkilendirme
@@ -893,7 +922,7 @@ export default function PasswordManager({ isServerReady: isReady }: PasswordMana
                   </div>
                 </div>
 
-                {item.isOwner && isEditOpen && (
+                {isEditOpen && id !== null && (
                   <div
                     style={{
                       marginTop: 18,
@@ -902,7 +931,7 @@ export default function PasswordManager({ isServerReady: isReady }: PasswordMana
                     }}
                   >
                     <EditItemForm
-                      item={item}
+                      item={{ id, title: item.title, username: item.username }}
                       onCancel={() => setOpenPanel(null)}
                       onSaved={() => {
                         setOpenPanel(null);
@@ -918,7 +947,7 @@ export default function PasswordManager({ isServerReady: isReady }: PasswordMana
                   </div>
                 )}
 
-                {item.isOwner && isAuthorizationOpen && (
+                {isOwner && isAuthorizationOpen && (
                   <div
                     style={{
                       marginTop: 18,
@@ -926,7 +955,7 @@ export default function PasswordManager({ isServerReady: isReady }: PasswordMana
                       borderTop: "1px solid #353b48",
                     }}
                   >
-                    <SharingPanel id={item.id} />
+                    <SharingPanel item={item.vault} data={data} isOnline={isOnline} />
                   </div>
                 )}
               </article>

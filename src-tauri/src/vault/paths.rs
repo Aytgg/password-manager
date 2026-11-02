@@ -16,6 +16,8 @@ pub struct VaultPaths {
     pub owner_binding: PathBuf,
     pub stronghold: PathBuf,
     pub owner_binding_temp: PathBuf,
+    /// Çevrimdışı erişim için sunucudaki kayıtların şifreli kopyası.
+    pub items_cache: PathBuf,
 }
 
 impl VaultPaths {
@@ -27,6 +29,7 @@ impl VaultPaths {
         Self {
             master_key: dir.join("master-key.json"),
             stronghold: dir.join("vault.hold"),
+            items_cache: dir.join("items-cache.json"),
             owner_binding,
             owner_binding_temp,
             dir,
@@ -50,12 +53,13 @@ impl VaultPaths {
         ))
     }
 
-    pub fn all_files(&self) -> [&PathBuf; 4] {
+    pub fn all_files(&self) -> [&PathBuf; 5] {
         [
             &self.master_key,
             &self.owner_binding,
             &self.stronghold,
             &self.owner_binding_temp,
+            &self.items_cache,
         ]
     }
 

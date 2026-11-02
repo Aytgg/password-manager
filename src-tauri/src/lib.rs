@@ -28,6 +28,7 @@ use crate::storage::{
     key_store::PlatformKeyStore,
 };
 use crate::vault::{
+    cache,
     key_file::{
         load_protected_master_key, replace_protected_master_key, save_protected_master_key,
     },
@@ -265,7 +266,7 @@ async fn create_vault(
 
             save_owner_binding(&paths.owner_binding, &master_key, &owner)?;
 
-            session.unlock(identity, key_store, owner)?;
+            session.unlock(identity, key_store, owner, cache::derive_cache_key(&master_key)?)?;
 
             Ok::<(), String>(())
         })();
@@ -330,7 +331,7 @@ async fn unlock_vault(
             auth_secret: hex::encode(*keys.auth_secret),
         };
 
-        session.unlock(identity, key_store, owner)?;
+        session.unlock(identity, key_store, owner, cache::derive_cache_key(&master_key)?)?;
 
         Ok(info)
     })
@@ -397,6 +398,33 @@ fn commit_password_change(
     let paths = VaultPaths::for_email(&app_data_dir(&app)?, &owner.email)?;
 
     replace_protected_master_key(&paths.master_key, &protected)
+}
+
+fn items_cache_path(app: &tauri::AppHandle, email: &str) -> Result<PathBuf, String> {
+    Ok(VaultPaths::for_email(&app_data_dir(app)?, email)?.items_cache)
+}
+
+/// Yerel kayıt önbelleği; içeriği arayüz belirler. Çevrimdışı açılışta liste
+/// buradan gelir.
+#[tauri::command]
+fn load_items_cache(
+    app: tauri::AppHandle,
+    session: tauri::State<'_, Arc<VaultSession>>,
+) -> Result<Option<serde_json::Value>, String> {
+    session.with_cache_key(|owner, key| {
+        cache::load_cache(&items_cache_path(&app, &owner.email)?, key, &owner.user_id)
+    })
+}
+
+#[tauri::command]
+fn save_items_cache(
+    app: tauri::AppHandle,
+    session: tauri::State<'_, Arc<VaultSession>>,
+    content: serde_json::Value,
+) -> Result<(), String> {
+    session.with_cache_key(|owner, key| {
+        cache::save_cache(&items_cache_path(&app, &owner.email)?, key, &owner.user_id, &content)
+    })
 }
 
 /// Bu hesabın X25519 açık anahtarı (base64). Convex'teki kullanıcı kaydına
@@ -674,6 +702,8 @@ pub fn run() {
             wrap_item_key_for_recipient,
             rekey_item,
             edit_item,
+            load_items_cache,
+            save_items_cache,
             prepare_invite,
             derive_invite_verifier,
             create_department_key,
