@@ -38,6 +38,30 @@ function requireExactHolders(
   }
 }
 
+/**
+ * Departmanın anahtarı üretilmemiş ya da güncel anahtarı hiçbir sahipte
+ * kalmamışsa (ör. herkes kasasını sıfırladı ya da daveti yenilendi) yeni bir
+ * anahtar üretilmelidir. Aksi halde kimse anahtarı dağıtamaz ve departmanla
+ * paylaşılan parolalar hiçbir üyeye ulaşmaz.
+ */
+async function needsNewKey(
+  ctx: QueryCtx,
+  department: Doc<"departments">,
+  holders: Map<Id<"users">, unknown>,
+) {
+  if (department.keyVersion === 0) {
+    return true;
+  }
+
+  for (const userId of holders.keys()) {
+    if (await currentDepartmentKey(ctx, department, userId)) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
 async function requireDepartmentKey(
   ctx: QueryCtx,
   user: Doc<"users">,
@@ -81,7 +105,7 @@ export const pendingWork = query({
     for (const department of await ctx.db.query("departments").collect()) {
       const holders = await departmentKeyHolders(ctx, department._id);
 
-      if (department.keyVersion === 0) {
+      if (await needsNewKey(ctx, department, holders)) {
         if (user.role === "admin" && holders.has(user._id)) {
           inits.push({ departmentId: department._id, holders: holderList(holders) });
         }
@@ -137,7 +161,8 @@ export const pendingWork = query({
   },
 });
 
-/** Departmanın ilk anahtarını kaydeder; paketler bütün anahtar sahiplerini
+/** Departmanın ilk anahtarını (ya da hiçbir sahipte kalmamış anahtarın
+ * yerine yenisini) kaydeder; paketler bütün anahtar sahiplerini
  * kapsamalıdır. */
 export const initDepartmentKey = mutation({
   args: {
@@ -158,24 +183,45 @@ export const initDepartmentKey = mutation({
       throw new ConvexError("Departman bulunamadı.");
     }
 
-    if (department.keyVersion !== 0) {
+    const holders = await departmentKeyHolders(ctx, department._id);
+
+    if (!(await needsNewKey(ctx, department, holders))) {
       throw new ConvexError("Departman anahtarı zaten oluşturulmuş.");
     }
 
     assertPublicKey(args.publicKey);
     args.accesses.forEach((entry) => assertWrappedKey(entry.access));
-    requireExactHolders(await departmentKeyHolders(ctx, department._id), args.accesses);
+    requireExactHolders(holders, args.accesses);
+
+    const keyVersion = department.keyVersion + 1;
 
     await ctx.db.patch(department._id, {
       publicKey: args.publicKey,
-      keyVersion: 1,
+      keyVersion,
       needsRotation: false,
     });
+
+    // Kimsenin açamadığı eski anahtara ait paketler silinir; departmanla
+    // paylaşılan kayıtları sahiplerinin cihazı yeni anahtara paketler
+    // (items.pendingWork).
+    for (const row of await ctx.db
+      .query("departmentKeys")
+      .withIndex("by_department_and_user", (q) => q.eq("department", department._id))
+      .collect()) {
+      await ctx.db.delete(row._id);
+    }
+
+    for (const row of await ctx.db
+      .query("itemDepartmentAccess")
+      .withIndex("by_department", (q) => q.eq("department", department._id))
+      .collect()) {
+      await ctx.db.delete(row._id);
+    }
 
     for (const entry of args.accesses) {
       await ctx.db.insert("departmentKeys", {
         department: department._id,
-        keyVersion: 1,
+        keyVersion,
         userId: entry.userId,
         access: entry.access,
       });

@@ -419,6 +419,46 @@ describe("departman anahtarları", () => {
     expect((await getDepartment(ids.yazilim))!.needsRotation).toBe(true);
     expect((await getDepartment(ids.satis))!.needsRotation).toBe(true);
   });
+
+  test("bütün sahipler anahtarını kaybederse yönetici yeni anahtar üretir ve paylaşım tamamlanır", async () => {
+    const { ids, uid, as, runDepartmentWork, runItemWork, createItem, visible, departmentKeyNames, getDepartment } =
+      await setup();
+    await runDepartmentWork();
+
+    // Satış'ın bütün anahtar sahipleri kasasını sıfırlar (yeni kimlik).
+    await as("admin").mutation(api.users.setPublicKey, { publicKey: publicKey(41) });
+    await as("carol").mutation(api.users.setPublicKey, { publicKey: publicKey(44) });
+    await as("manager").mutation(api.users.setPublicKey, { publicKey: publicKey(45) });
+    expect(await departmentKeyNames(ids.satis)).toEqual([]);
+
+    const id = await createItem("alice");
+    await as("alice").mutation(api.items.setDepartmentGrant, {
+      id,
+      departmentId: ids.satis,
+      granted: true,
+    });
+    await runItemWork("alice");
+
+    // Kimse açamadığı için yönetici departman anahtarını yeniden üretir.
+    const work = await runDepartmentWork();
+    expect(work.inits.map((init) => init.departmentId)).toEqual([ids.satis]);
+    expect(await departmentKeyNames(ids.satis)).toEqual(["admin", "carol", "manager"]);
+    expect((await getDepartment(ids.satis))!.keyVersion).toBe(2);
+
+    // Eski anahtara paketli DEK geçersiz; sahibin cihazı yeni anahtara paketler.
+    expect((await runItemWork("alice")).fills).toHaveLength(1);
+    expect(await visible(uid("carol"))).toEqual([id]);
+    expect(await as("carol").query(api.items.pendingSharedCount, {})).toBe(0);
+
+    expect(await runDepartmentWork()).toEqual({ inits: [], fills: [], rotations: [] });
+    await expect(
+      as("admin").mutation(api.keys.initDepartmentKey, {
+        departmentId: ids.satis,
+        publicKey: publicKey(92),
+        accesses: [],
+      }),
+    ).rejects.toThrow(/zaten oluşturulmuş/);
+  });
 });
 
 describe("kişiye paylaşım ve rekey", () => {

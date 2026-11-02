@@ -36,26 +36,44 @@ function useWorker<T>(
   onError: (message: string) => void,
 ) {
   const runningRef = useRef(false);
+  // Çalışma sürerken sunucudan yeni iş listesi geldi mi; geldiyse çalışma
+  // (başarısız olsa bile) bitince güncel listeyle tekrar denenir.
+  const staleRef = useRef(false);
   const [tick, setTick] = useState(0);
   const runRef = useRef(run);
   runRef.current = run;
 
   useEffect(() => {
-    if (!work || runningRef.current || isEmpty(work)) {
+    if (!work) {
+      return;
+    }
+
+    if (runningRef.current) {
+      staleRef.current = true;
+      return;
+    }
+
+    if (isEmpty(work)) {
       return;
     }
 
     runningRef.current = true;
+    staleRef.current = false;
 
     runRef
       .current(work)
       .then(() => {
         onError("");
-        setTick((value) => value + 1);
+        staleRef.current = true;
       })
       .catch((error: unknown) => onError(errorMessage(error)))
       .finally(() => {
         runningRef.current = false;
+
+        if (staleRef.current) {
+          staleRef.current = false;
+          setTick((value) => value + 1);
+        }
       });
     // isEmpty ve onError sabit kabul edilir.
     // eslint-disable-next-line react-hooks/exhaustive-deps
