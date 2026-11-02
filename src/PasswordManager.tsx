@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import type React from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { useMutation, useQuery } from "convex/react";
+import { useConvex, useMutation, useQuery } from "convex/react";
 import type { FunctionReturnType } from "convex/server";
 
 import { api } from "../convex/_generated/api";
@@ -46,6 +46,8 @@ type PasswordItem = {
   id: Id<"items">;
   title: string;
   username: string | null;
+  /** Başlık ve kullanıcı adı çözüldü; düzenleme ancak o zaman açılır. */
+  decrypted: boolean;
   isOwner: boolean;
   server: ServerItem;
 };
@@ -344,6 +346,184 @@ function SharingPanel({ id }: { id: Id<"items"> }) {
   );
 }
 
+type RekeyedItem = {
+  metadata: SealedField;
+  secret: SealedField;
+  accesses: { userId: Id<"users">; access: WrappedKey }[];
+  departmentAccesses: { departmentId: Id<"departments">; keyVersion: number; access: WrappedKey }[];
+};
+
+/**
+ * Kaydın başlığını, kullanıcı adını ve parolasını değiştirir. Yalnızca sahip
+ * düzenleyebilir. Her düzenleme yeni bir DEK ile yapılır ve erişimi olan
+ * herkese yeniden paketlenir; parola alanı boş bırakılırsa mevcut parola
+ * korunur.
+ */
+function EditItemForm({
+  item,
+  onCancel,
+  onSaved,
+  onDeleted,
+}: {
+  item: PasswordItem;
+  onCancel: () => void;
+  onSaved: () => void;
+  onDeleted: () => void;
+}) {
+  const convex = useConvex();
+  const rekeyItem = useMutation(api.items.rekey);
+  const removeItem = useMutation(api.items.remove);
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
+
+  const [title, setTitle] = useState(item.title);
+  const [username, setUsername] = useState(item.username ?? "");
+  const [password, setPassword] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  async function handleSubmit(
+    event: Parameters<NonNullable<React.ComponentProps<"form">["onSubmit"]>>[0],
+  ) {
+    event.preventDefault();
+
+    if (saving) return;
+
+    if (!title.trim()) {
+      setError("Başlık boş olamaz.");
+      return;
+    }
+
+    setSaving(true);
+    setError("");
+
+    try {
+      // Alıcılar düzenleme anında sunucudan alınır; liste eskiyse sunucu
+      // reddeder ve kullanıcı tekrar dener.
+      const targets = await convex.query(api.items.editTargets, { id: item.id });
+
+      const edited = await invoke<RekeyedItem>("edit_item", {
+        item: toEncryptedItem(targets.item),
+        recipients: targets.recipients,
+        departmentRecipients: targets.departments,
+        title: title.trim(),
+        username: username.trim() || null,
+        password: password || null,
+      });
+
+      await rekeyItem({ id: item.id, keyVersion: targets.item.keyVersion, ...edited });
+
+      setPassword("");
+      onSaved();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  async function handleDelete() {
+    if (saving) return;
+
+    setSaving(true);
+    setError("");
+
+    try {
+      await removeItem({ id: item.id });
+      onDeleted();
+    } catch (err) {
+      setError(errorMessage(err));
+      setSaving(false);
+    }
+  }
+
+  return (
+    <form onSubmit={handleSubmit}>
+      <label htmlFor={`edit-title-${item.id}`}>Başlık</label>
+      <input
+        id={`edit-title-${item.id}`}
+        style={styles.input}
+        value={title}
+        onChange={(event) => setTitle(event.target.value)}
+        disabled={saving}
+        required
+      />
+
+      <label htmlFor={`edit-username-${item.id}`}>Kullanıcı adı (isteğe bağlı)</label>
+      <input
+        id={`edit-username-${item.id}`}
+        style={styles.input}
+        value={username}
+        onChange={(event) => setUsername(event.target.value)}
+        disabled={saving}
+      />
+
+      <label htmlFor={`edit-password-${item.id}`}>Yeni parola</label>
+      <input
+        id={`edit-password-${item.id}`}
+        type="password"
+        autoComplete="new-password"
+        style={styles.input}
+        value={password}
+        onChange={(event) => setPassword(event.target.value)}
+        placeholder="Değiştirmeyeceksen boş bırak"
+        disabled={saving}
+      />
+
+      {error && (
+        <p role="alert" style={styles.error}>
+          {error}
+        </p>
+      )}
+
+      <div style={{ display: "flex", gap: 8 }}>
+        <button type="submit" style={{ ...styles.button, opacity: saving ? 0.6 : 1 }} disabled={saving}>
+          {saving ? "Kaydediliyor..." : "Değişiklikleri kaydet"}
+        </button>
+        <button type="button" style={styles.secondaryButton} onClick={onCancel} disabled={saving}>
+          Vazgeç
+        </button>
+      </div>
+
+      <div style={{ marginTop: 18, paddingTop: 14, borderTop: "1px solid #353b48" }}>
+        {confirmingDelete ? (
+          <>
+            <p style={{ ...styles.error, marginTop: 0 }}>
+              Kayıt, paylaşılan herkes için kalıcı olarak silinecek. Bu işlem geri alınamaz.
+            </p>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button
+                type="button"
+                style={{ ...styles.button, background: "#dc2626" }}
+                onClick={() => void handleDelete()}
+                disabled={saving}
+              >
+                {saving ? "Siliniyor..." : "Evet, kalıcı olarak sil"}
+              </button>
+              <button
+                type="button"
+                style={styles.secondaryButton}
+                onClick={() => setConfirmingDelete(false)}
+                disabled={saving}
+              >
+                Vazgeç
+              </button>
+            </div>
+          </>
+        ) : (
+          <button
+            type="button"
+            style={{ ...styles.secondaryButton, color: "#f87171" }}
+            onClick={() => setConfirmingDelete(true)}
+            disabled={saving}
+          >
+            Kaydı sil
+          </button>
+        )}
+      </div>
+    </form>
+  );
+}
+
 export default function PasswordManager({ isServerReady: isReady }: PasswordManagerProps) {
   // Convex sorguları canlıdır; sunucudaki değişiklikler otomatik gelir.
   const serverItems = useQuery(api.items.listMine, isReady ? {} : "skip");
@@ -371,8 +551,16 @@ export default function PasswordManager({ isServerReady: isReady }: PasswordMana
     null,
   );
 
-  const [openAuthorizationPasswordId, setOpenAuthorizationPasswordId] =
-    useState<Id<"items"> | null>(null);
+  // Bir kartta aynı anda tek panel açık olur: yetkilendirme ya da düzenleme.
+  const [openPanel, setOpenPanel] = useState<{
+    id: Id<"items">;
+    kind: "sharing" | "edit";
+  } | null>(null);
+
+  const togglePanel = (id: Id<"items">, kind: "sharing" | "edit") =>
+    setOpenPanel((current) =>
+      current?.id === id && current.kind === kind ? null : { id, kind },
+    );
 
   // Başlık ve kullanıcı adı şifreli geldiği için liste her değiştiğinde
   // meta veri Rust tarafında çözülür. Parolaların kendisi çözülmez.
@@ -425,6 +613,7 @@ export default function PasswordManager({ isServerReady: isReady }: PasswordMana
           id: item.id,
           title: metadata?.title ?? (metadata?.error ? "Çözülemedi" : "…"),
           username: metadata?.username ?? null,
+          decrypted: typeof metadata?.title === "string",
           isOwner: item.isOwner,
           server: item,
         };
@@ -614,7 +803,9 @@ export default function PasswordManager({ isServerReady: isReady }: PasswordMana
       ) : (
         <div style={{ display: "grid", gap: 12, marginTop: 16 }}>
           {items.map((item) => {
-            const isAuthorizationOpen = openAuthorizationPasswordId === item.id;
+            const isAuthorizationOpen =
+              openPanel?.id === item.id && openPanel.kind === "sharing";
+            const isEditOpen = openPanel?.id === item.id && openPanel.kind === "edit";
 
             return (
               <article key={item.id} style={styles.card}>
@@ -673,16 +864,27 @@ export default function PasswordManager({ isServerReady: isReady }: PasswordMana
                       <button
                         type="button"
                         style={{
+                          ...styles.secondaryButton,
+                          background: isEditOpen ? "#4b5563" : styles.secondaryButton.background,
+                        }}
+                        onClick={() => togglePanel(item.id, "edit")}
+                        disabled={!item.decrypted}
+                        aria-expanded={isEditOpen}
+                      >
+                        Düzenle
+                      </button>
+                    )}
+
+                    {item.isOwner && (
+                      <button
+                        type="button"
+                        style={{
                           ...styles.button,
                           background: isAuthorizationOpen
                             ? "#4b5563"
                             : "#6366f1",
                         }}
-                        onClick={() =>
-                          setOpenAuthorizationPasswordId(
-                            isAuthorizationOpen ? null : item.id,
-                          )
-                        }
+                        onClick={() => togglePanel(item.id, "sharing")}
                         aria-expanded={isAuthorizationOpen}
                       >
                         Yetkilendirme
@@ -690,6 +892,31 @@ export default function PasswordManager({ isServerReady: isReady }: PasswordMana
                     )}
                   </div>
                 </div>
+
+                {item.isOwner && isEditOpen && (
+                  <div
+                    style={{
+                      marginTop: 18,
+                      paddingTop: 16,
+                      borderTop: "1px solid #353b48",
+                    }}
+                  >
+                    <EditItemForm
+                      item={item}
+                      onCancel={() => setOpenPanel(null)}
+                      onSaved={() => {
+                        setOpenPanel(null);
+                        setError("");
+                        setSuccess("Parola güncellendi.");
+                      }}
+                      onDeleted={() => {
+                        setOpenPanel(null);
+                        setError("");
+                        setSuccess("Kayıt silindi.");
+                      }}
+                    />
+                  </div>
+                )}
 
                 {item.isOwner && isAuthorizationOpen && (
                   <div

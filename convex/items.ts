@@ -194,6 +194,29 @@ export const create = mutation({
   },
 });
 
+/**
+ * Kaydı kalıcı olarak siler. Yalnızca sahip yapabilir; kayıtla birlikte
+ * bütün anahtar paketleri ve paylaşım kuralları da silinir.
+ */
+export const remove = mutation({
+  args: { id: v.id("items") },
+  handler: async (ctx, args) => {
+    const user = await requireActiveUser(ctx);
+    const item = await requireOwnedItem(ctx, user._id, args.id);
+
+    for (const table of ["itemAccess", "itemDepartmentAccess", "itemGrants"] as const) {
+      for (const row of await ctx.db
+        .query(table)
+        .withIndex("by_item", (q) => q.eq("item", item._id))
+        .collect()) {
+        await ctx.db.delete(row._id);
+      }
+    }
+
+    await ctx.db.delete(item._id);
+  },
+});
+
 /** Sahibin yetkilendirme paneli: departman ve kişi bazında paylaşım durumu. */
 export const sharing = query({
   args: { id: v.id("items") },
@@ -546,6 +569,79 @@ export const rekey = mutation({
   },
 });
 
+/** Kaydın anahtar paketlerini kimlerin alması gerektiği ve şu an kimlerde
+ * olduğu. */
+async function keyTargets(ctx: QueryCtx, item: Doc<"items">) {
+  const recipients = await directRecipients(ctx, item);
+  const { departmentIds } = await itemGrants(ctx, item._id);
+
+  const currentUsers = new Set(
+    (
+      await ctx.db
+        .query("itemAccess")
+        .withIndex("by_item", (q) => q.eq("item", item._id))
+        .collect()
+    ).map((row) => row.userId),
+  );
+
+  const departments = [];
+  for (const departmentId of departmentIds) {
+    const department = await ctx.db.get(departmentId);
+
+    if (department && department.keyVersion > 0 && department.publicKey) {
+      departments.push({
+        departmentId,
+        keyVersion: department.keyVersion,
+        publicKey: department.publicKey,
+        hasCurrentKey:
+          (await departmentAccessRow(ctx, item._id, departmentId))?.keyVersion ===
+          department.keyVersion,
+      });
+    }
+  }
+
+  return { recipients, currentUsers, departments };
+}
+
+/** Yeni bir DEK'in paketlenmesi gerekenler: anahtarı hâlâ kurala uyan
+ * kişiler (eksikler sonra doldurulur) ve anahtarı hazır bütün departmanlar. */
+async function rekeyRecipients(ctx: QueryCtx, item: Doc<"items">, ownerId: Id<"users">) {
+  const { recipients, currentUsers, departments } = await keyTargets(ctx, item);
+
+  return {
+    recipients: [...currentUsers]
+      .filter((id) => id !== ownerId && recipients.has(id))
+      .map((id) => ({ userId: id, publicKey: recipients.get(id)!.publicKey })),
+    departments: departments.map(({ departmentId, keyVersion, publicKey }) => ({
+      departmentId,
+      keyVersion,
+      publicKey,
+    })),
+  };
+}
+
+/**
+ * Düzenleme için: kaydın sahibine ait güncel hali ve yeni DEK'in
+ * paketleneceği alıcılar. Düzenleme `rekey` ile kaydedilir.
+ */
+export const editTargets = query({
+  args: { id: v.id("items") },
+  handler: async (ctx, args) => {
+    const user = await requireActiveUser(ctx);
+    const item = await requireOwnedItem(ctx, user._id, args.id);
+    const access = await myAccess(ctx, item._id, user._id);
+
+    if (!access) {
+      throw new ConvexError("Bu parolaya erişimin yok.");
+    }
+
+    return {
+      item: serialize(item, { kind: "direct", access: access.access }, user._id),
+      ...(await rekeyRecipients(ctx, item, user._id)),
+    };
+  },
+});
+
 /**
  * Kayıtlarla ilgili, istemcinin arka planda yapması gereken şifreleme işleri:
  * - fills: doğrudan erişimim olan kayıtlarda, kurala göre paketi eksik
@@ -570,49 +666,13 @@ export const pendingWork = query({
         continue;
       }
 
-      const recipients = await directRecipients(ctx, item);
-      const { departmentIds } = await itemGrants(ctx, item._id);
-
-      const currentUsers = new Set(
-        (
-          await ctx.db
-            .query("itemAccess")
-            .withIndex("by_item", (q) => q.eq("item", item._id))
-            .collect()
-        ).map((row) => row.userId),
-      );
-
-      const departments = [];
-      for (const departmentId of departmentIds) {
-        const department = await ctx.db.get(departmentId);
-
-        if (department && department.keyVersion > 0 && department.publicKey) {
-          departments.push({
-            departmentId,
-            keyVersion: department.keyVersion,
-            publicKey: department.publicKey,
-            hasCurrentKey:
-              (await departmentAccessRow(ctx, item._id, departmentId))?.keyVersion ===
-              department.keyVersion,
-          });
-        }
-      }
+      const { recipients, currentUsers, departments } = await keyTargets(ctx, item);
 
       const serialized = serialize(item, { kind: "direct", access: access.access }, user._id);
 
       if (item.needsRekey) {
         if (item.ownerId === user._id) {
-          rekeys.push({
-            item: serialized,
-            recipients: [...currentUsers]
-              .filter((id) => id !== user._id && recipients.has(id))
-              .map((id) => ({ userId: id, publicKey: recipients.get(id)!.publicKey })),
-            departments: departments.map(({ departmentId, keyVersion, publicKey }) => ({
-              departmentId,
-              keyVersion,
-              publicKey,
-            })),
-          });
+          rekeys.push({ item: serialized, ...(await rekeyRecipients(ctx, item, user._id)) });
         }
 
         // Eski DEK artık dağıtılmamalı; eksikler rekey sonrası yeni DEK

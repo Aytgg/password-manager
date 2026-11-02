@@ -515,6 +515,36 @@ fn rekey_item(
     })
 }
 
+/// Kaydı yeni içerikle yeniden şifreler. `password` verilmezse mevcut parola
+/// korunur. Açık parola Rust'a girer, React'e geri dönmez.
+#[tauri::command]
+fn edit_item(
+    session: tauri::State<'_, Arc<VaultSession>>,
+    item: EncryptedItem,
+    recipients: Vec<Recipient>,
+    department_recipients: Vec<DepartmentRecipient>,
+    title: String,
+    username: Option<String>,
+    password: Option<String>,
+) -> Result<RekeyedItem, String> {
+    let password = password.filter(|value| !value.is_empty()).map(Zeroizing::new);
+
+    session.with_identity(|identity, owner| {
+        items::edit(
+            identity,
+            &owner.user_id,
+            &item,
+            &recipients,
+            &department_recipients,
+            &items::ItemChanges {
+                title: &title,
+                username: username.as_deref(),
+                password: password.as_ref().map(|value| value.as_bytes()),
+            },
+        )
+    })
+}
+
 #[tauri::command]
 fn create_department_key(holders: Vec<Recipient>) -> Result<NewDepartmentKey, String> {
     departments::create_department_key(&holders)
@@ -643,6 +673,7 @@ pub fn run() {
             copy_item_password_to_clipboard,
             wrap_item_key_for_recipient,
             rekey_item,
+            edit_item,
             prepare_invite,
             derive_invite_verifier,
             create_department_key,

@@ -343,14 +343,65 @@ pub fn rekey(
     recipients: &[Recipient],
     departments: &[DepartmentRecipient],
 ) -> Result<RekeyedItem, String> {
+    reencrypt(identity, owner_id, item, recipients, departments, None)
+}
+
+/// Kayıtta yapılacak değişiklik. `password` boşsa mevcut parola korunur.
+pub struct ItemChanges<'a> {
+    pub title: &'a str,
+    pub username: Option<&'a str>,
+    pub password: Option<&'a [u8]>,
+}
+
+/// Kaydı yeni içerikle ve yeni bir DEK ile yeniden şifreler. Her düzenleme
+/// aynı zamanda bir rekey'dir: daha önce erişimi kaldırılmış birinin elindeki
+/// eski DEK yeni parolayı açamaz.
+pub fn edit(
+    identity: &IdentityKeyPair,
+    owner_id: &str,
+    item: &EncryptedItem,
+    recipients: &[Recipient],
+    departments: &[DepartmentRecipient],
+    changes: &ItemChanges,
+) -> Result<RekeyedItem, String> {
+    reencrypt(identity, owner_id, item, recipients, departments, Some(changes))
+}
+
+fn reencrypt(
+    identity: &IdentityKeyPair,
+    owner_id: &str,
+    item: &EncryptedItem,
+    recipients: &[Recipient],
+    departments: &[DepartmentRecipient],
+    changes: Option<&ItemChanges>,
+) -> Result<RekeyedItem, String> {
     require_owner(owner_id, item)?;
 
     let old_dek = unwrap_item_dek(identity, item)?;
     let metadata_aad = metadata_aad(&item.owner_id, &item.item_id);
     let secret_aad = secret_aad(&item.owner_id, &item.item_id);
 
-    let metadata = open(&item.metadata, &old_dek, &metadata_aad)?;
-    let secret = open(&item.secret, &old_dek, &secret_aad)?;
+    let mut metadata = open(&item.metadata, &old_dek, &metadata_aad)?;
+    let mut secret = open(&item.secret, &old_dek, &secret_aad)?;
+
+    if let Some(changes) = changes {
+        let updated = ItemMetadata {
+            title: changes.title.trim().to_string(),
+            username: changes
+                .username
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string),
+        };
+
+        validate_metadata(&updated)?;
+        metadata = Zeroizing::new(serde_json::to_vec(&updated).map_err(|error| error.to_string())?);
+
+        if let Some(password) = changes.password {
+            validate_secret(password)?;
+            secret = Zeroizing::new(password.to_vec());
+        }
+    }
 
     let new_dek = password_encryption::generate_dek();
 
@@ -536,6 +587,76 @@ mod tests {
 
         // Eski paketlenmiş anahtar yeni şifreli veriyi açamaz.
         assert!(decrypt_secret(&removed, &after(removed_access)).is_err());
+    }
+
+    #[test]
+    fn edit_changes_content_and_keeps_password_when_not_given() {
+        let owner = IdentityKeyPair::generate();
+        let recipient = IdentityKeyPair::generate();
+
+        let new_item = encrypt_new_item(&owner, "owner", "Eski", Some("ali"), b"pw1").unwrap();
+        let owner_item = stored(&new_item, "owner", new_item.owner_access.clone());
+        let recipients = [Recipient {
+            user_id: "r".to_string(),
+            public_key: encode_public_key(&recipient.public_key()),
+        }];
+
+        let renamed = edit(
+            &owner,
+            "owner",
+            &owner_item,
+            &recipients,
+            &[],
+            &ItemChanges { title: " Yeni ", username: Some(" "), password: None },
+        )
+        .unwrap();
+
+        let as_recipient = EncryptedItem {
+            metadata: renamed.metadata.clone(),
+            secret: renamed.secret.clone(),
+            access: ItemAccess::Direct { access: renamed.accesses[1].access.clone() },
+            ..owner_item.clone()
+        };
+
+        assert_eq!(
+            decrypt_metadata(&recipient, &as_recipient).unwrap(),
+            ItemMetadata { title: "Yeni".to_string(), username: None }
+        );
+        assert_eq!(decrypt_secret(&recipient, &as_recipient).unwrap().as_slice(), b"pw1");
+
+        let changed = edit(
+            &owner,
+            "owner",
+            &owner_item,
+            &[],
+            &[],
+            &ItemChanges { title: "Yeni", username: None, password: Some(b"pw2") },
+        )
+        .unwrap();
+
+        let as_owner = EncryptedItem {
+            metadata: changed.metadata,
+            secret: changed.secret,
+            access: ItemAccess::Direct { access: changed.accesses[0].access.clone() },
+            ..owner_item.clone()
+        };
+        assert_eq!(decrypt_secret(&owner, &as_owner).unwrap().as_slice(), b"pw2");
+    }
+
+    #[test]
+    fn edit_is_owner_only_and_validated() {
+        let owner = IdentityKeyPair::generate();
+        let new_item = encrypt_new_item(&owner, "owner", "A", None, b"pw").unwrap();
+        let item = stored(&new_item, "owner", new_item.owner_access.clone());
+
+        let changes = ItemChanges { title: "B", username: None, password: None };
+        assert!(edit(&owner, "other", &item, &[], &[], &changes).is_err());
+
+        let empty_title = ItemChanges { title: " ", username: None, password: None };
+        assert!(edit(&owner, "owner", &item, &[], &[], &empty_title).is_err());
+
+        let empty_password = ItemChanges { title: "B", username: None, password: Some(b"") };
+        assert!(edit(&owner, "owner", &item, &[], &[], &empty_password).is_err());
     }
 
     #[test]

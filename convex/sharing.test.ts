@@ -490,6 +490,72 @@ describe("kişiye paylaşım ve rekey", () => {
     expect((await as("alice").query(api.items.pendingWork, {})).rekeys).toHaveLength(0);
   });
 
+  test("düzenleme: yalnız sahip, yeni DEK tüm alıcılara paketlenir", async () => {
+    const { ids, uid, as, runDepartmentWork, createItem, shareWithUser, shareWithDepartment, getItem, visible } =
+      await setup();
+    await runDepartmentWork();
+
+    const id = await createItem("alice");
+    await shareWithUser("alice", id, uid("carol"));
+    await shareWithDepartment("alice", id, ids.yazilim);
+
+    await expect(as("carol").query(api.items.editTargets, { id })).rejects.toThrow(
+      /sahibi değilsin/,
+    );
+
+    const targets = await as("alice").query(api.items.editTargets, { id });
+    expect(targets.item.access.kind).toBe("direct");
+    expect(targets.recipients.map((r) => r.userId)).toEqual([uid("carol")]);
+    expect(targets.departments.map((d) => d.departmentId)).toEqual([ids.yazilim]);
+
+    await as("alice").mutation(api.items.rekey, {
+      id,
+      keyVersion: targets.item.keyVersion,
+      metadata: sealed(7),
+      secret: sealed(8),
+      accesses: [
+        { userId: uid("alice"), access: wrapped(40) },
+        { userId: uid("carol"), access: wrapped(41) },
+      ],
+      departmentAccesses: targets.departments.map((d) => ({
+        departmentId: d.departmentId,
+        keyVersion: d.keyVersion,
+        access: wrapped(42),
+      })),
+    });
+
+    expect(await getItem(id)).toMatchObject({ keyVersion: 2, metadata: sealed(7), secret: sealed(8) });
+    expect(await visible(uid("carol"))).toEqual([id]);
+    expect(await visible(uid("bob"))).toEqual([id]);
+  });
+
+  test("silme: yalnız sahip; kayıt, paketler ve paylaşım kuralları silinir", async () => {
+    const { t, ids, uid, as, runDepartmentWork, createItem, shareWithUser, shareWithDepartment, visible } =
+      await setup();
+    await runDepartmentWork();
+
+    const id = await createItem("alice");
+    await shareWithUser("alice", id, uid("carol"));
+    await shareWithDepartment("alice", id, ids.yazilim);
+
+    await expect(as("carol").mutation(api.items.remove, { id })).rejects.toThrow(/sahibi değilsin/);
+
+    await as("alice").mutation(api.items.remove, { id });
+
+    expect(await visible(uid("alice"))).toEqual([]);
+    expect(await visible(uid("carol"))).toEqual([]);
+    expect(await visible(uid("bob"))).toEqual([]);
+
+    const leftovers = await t.run(async (ctx) =>
+      Promise.all(
+        (["itemAccess", "itemDepartmentAccess", "itemGrants"] as const).map(
+          async (table) => (await ctx.db.query(table).collect()).length,
+        ),
+      ),
+    );
+    expect(leftovers).toEqual([0, 0, 0]);
+  });
+
   test("rekey beklerken eski anahtar dağıtılmaz", async () => {
     const { uid, as, createItem, shareWithUser } = await setup();
     const id = await createItem("alice");
