@@ -1,21 +1,17 @@
 import { ConvexError, v } from "convex/values";
 import type { Infer } from "convex/values";
 
-import { internal } from "./_generated/api";
 import type { Doc, Id } from "./_generated/dataModel";
 import type { QueryCtx } from "./_generated/server";
+import { mutation, query } from "./_generated/server";
 import {
-  action,
-  internalMutation,
-  internalQuery,
-  mutation,
-  query,
-} from "./_generated/server";
-import {
+  assertAuthSecret,
+  assertPublicKey,
   canManageUser,
   normalizeEmail,
   reconcileUserAccess,
   requireActiveUser,
+  sha256Hex,
 } from "./lib";
 import { role } from "./schema";
 
@@ -66,62 +62,98 @@ async function checkInvite(
   return email;
 }
 
-export const prepareInvite = internalQuery({
-  args: inviteArgs,
-  handler: async (ctx, args) => {
-    const actor = await requireActiveUser(ctx);
-    return await checkInvite(ctx, actor, args);
-  },
-});
+// Davetin geçerlilik süresi (saat); arayüzdeki seçeneklerle aynı.
+const INVITE_TTL_HOURS = [24, 72, 168];
 
-export const createInvited = internalMutation({
-  args: inviteArgs,
+/**
+ * Davet kodu yöneticinin cihazında üretilir; sunucuya yalnızca koddan
+ * türetilen geçici açık anahtar ve doğrulayıcı gelir. Doğrulayıcının özeti
+ * saklanır, kodun kendisi hiç görülmez.
+ */
+const inviteKeyArgs = {
+  publicKey: v.string(),
+  verifier: v.string(),
+  expiresInHours: v.number(),
+};
+
+async function inviteFields(args: { publicKey: string; verifier: string; expiresInHours: number }) {
+  if (!INVITE_TTL_HOURS.includes(args.expiresInHours)) {
+    throw new ConvexError("Geçersiz davet süresi.");
+  }
+
+  assertPublicKey(args.publicKey);
+
+  return {
+    publicKey: args.publicKey,
+    inviteVerifierHash: await sha256Hex(assertAuthSecret(args.verifier)),
+    inviteExpiresAt: Date.now() + args.expiresInHours * 60 * 60 * 1000,
+  };
+}
+
+export const invite = mutation({
+  args: { ...inviteArgs, ...inviteKeyArgs },
+  returns: v.object({ expiresAt: v.number() }),
   handler: async (ctx, args) => {
     const actor = await requireActiveUser(ctx);
     const email = await checkInvite(ctx, actor, args);
+    const fields = await inviteFields(args);
     const now = Date.now();
 
     await ctx.db.insert("users", {
       email,
       role: args.role,
-      departmentId: args.role === "admin" ? args.departmentId : args.departmentId!,
+      departmentId: args.departmentId,
       status: "invited",
+      ...fields,
       createdAt: now,
       updatedAt: now,
     });
+
+    return { expiresAt: fields.inviteExpiresAt };
   },
 });
 
-export const invite = action({
-  args: inviteArgs,
+/**
+ * Henüz kaydolmamış bir kullanıcı için yeni davet kodu kaydeder; eskisi
+ * geçersizleşir. Eski geçici anahtara paketlenmiş anahtarlar artık
+ * açılamayacağı için silinir: departman anahtarlarını yöneticinin cihazı
+ * hemen yeniden paketler, kişiye doğrudan paylaşılanları ise paylaşan kişi
+ * çevrimiçi olduğunda.
+ */
+export const renewInvite = mutation({
+  args: { id: v.id("users"), ...inviteKeyArgs },
+  returns: v.object({ expiresAt: v.number() }),
   handler: async (ctx, args) => {
-    const email = await ctx.runQuery(internal.members.prepareInvite, args);
+    const actor = await requireActiveUser(ctx);
+    const target = await ctx.db.get(args.id);
 
-    const secretKey = process.env.CLERK_SECRET_KEY;
-
-    if (!secretKey) {
-      throw new ConvexError("Sunucuda CLERK_SECRET_KEY tanımlı değil.");
+    if (!target || !canManageUser(actor, target)) {
+      throw new ConvexError("Bu kullanıcıyı yönetme yetkin yok.");
     }
 
-    const response = await fetch("https://api.clerk.com/v1/invitations", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${secretKey}`,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({
-        email_address: email,
-        notify: true,
-        ignore_existing: true,
-      }),
-    });
-
-    if (!response.ok) {
-      console.error("Clerk invitation failed", response.status, await response.text());
-      throw new ConvexError(`Clerk daveti gönderilemedi (HTTP ${response.status}).`);
+    if (target.status !== "invited") {
+      throw new ConvexError("Bu kullanıcı daveti zaten kullanmış.");
     }
 
-    await ctx.runMutation(internal.members.createInvited, args);
+    const fields = await inviteFields(args);
+
+    for (const access of await ctx.db
+      .query("itemAccess")
+      .withIndex("by_user", (q) => q.eq("userId", target._id))
+      .collect()) {
+      await ctx.db.delete(access._id);
+    }
+
+    for (const key of await ctx.db
+      .query("departmentKeys")
+      .withIndex("by_user", (q) => q.eq("userId", target._id))
+      .collect()) {
+      await ctx.db.delete(key._id);
+    }
+
+    await ctx.db.patch(target._id, { ...fields, updatedAt: Date.now() });
+
+    return { expiresAt: fields.inviteExpiresAt };
   },
 });
 
@@ -159,6 +191,7 @@ export const list = query({
           ? (departments.get(user.departmentId) ?? null)
           : null,
         hasPublicKey: user.publicKey !== undefined,
+        inviteExpiresAt: user.status === "invited" ? (user.inviteExpiresAt ?? null) : null,
         isSelf: user._id === actor._id,
         canManage: canManageUser(actor, user),
       }))
@@ -207,7 +240,7 @@ export const update = mutation({
     if (args.enabled === false) {
       nextStatus = "disabled";
     } else if (args.enabled === true && target.status === "disabled") {
-      nextStatus = target.clerkId ? "active" : "invited";
+      nextStatus = target.inviteVerifierHash === undefined ? "active" : "invited";
     }
 
     await ctx.db.patch(target._id, {
@@ -217,8 +250,6 @@ export const update = mutation({
       updatedAt: Date.now(),
     });
 
-    if (target.clerkId) {
-      await reconcileUserAccess(ctx, target.clerkId);
-    }
+    await reconcileUserAccess(ctx, target._id);
   },
 });

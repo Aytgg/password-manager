@@ -3,12 +3,12 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 const VAULTS_DIR_NAME: &str = "vaults";
-const USER_DIR_DOMAIN: &[u8] = b"password-manager/vault-dir/v1:";
+const USER_DIR_DOMAIN: &[u8] = b"password-manager/vault-dir/v2:";
 
 /// Bir yerel kasanın diskteki dosyaları.
 ///
-/// Her Clerk hesabı `app_data_dir/vaults/<hash>/` altında kendi kasasına
-/// sahiptir. Klasör adı kullanıcı kimliğinin hash'idir; böylece kimlik
+/// Her hesap (e-posta) `app_data_dir/vaults/<hash>/` altında kendi kasasına
+/// sahiptir. Klasör adı e-postanın hash'idir; böylece e-posta
 /// doğrudan dosya sistemine yansımaz ve yol karakterleri sorun çıkarmaz.
 pub struct VaultPaths {
     pub dir: PathBuf,
@@ -33,16 +33,16 @@ impl VaultPaths {
         }
     }
 
-    pub fn for_user(app_data_dir: &Path, user_id: &str) -> Result<Self, String> {
-        let user_id = user_id.trim();
+    pub fn for_email(app_data_dir: &Path, email: &str) -> Result<Self, String> {
+        let email = crate::crypto::kdf::normalize_email(email);
 
-        if user_id.is_empty() {
-            return Err("Clerk kullanıcı kimliği boş olamaz.".to_string());
+        if email.is_empty() {
+            return Err("E-posta boş olamaz.".to_string());
         }
 
         let mut hasher = Sha256::new();
         hasher.update(USER_DIR_DOMAIN);
-        hasher.update(user_id.as_bytes());
+        hasher.update(email.as_bytes());
         let digest = hex::encode(hasher.finalize());
 
         Ok(Self::in_dir(
@@ -83,9 +83,9 @@ mod tests {
     fn users_get_separate_directories() {
         let root = tempdir().unwrap();
 
-        let a = VaultPaths::for_user(root.path(), "user-a").unwrap();
-        let b = VaultPaths::for_user(root.path(), "user-b").unwrap();
-        let a_again = VaultPaths::for_user(root.path(), " user-a ").unwrap();
+        let a = VaultPaths::for_email(root.path(), "a@x.com").unwrap();
+        let b = VaultPaths::for_email(root.path(), "b@x.com").unwrap();
+        let a_again = VaultPaths::for_email(root.path(), " A@x.com ").unwrap();
 
         assert_ne!(a.dir, b.dir);
         assert_eq!(a.dir, a_again.dir);
@@ -93,8 +93,8 @@ mod tests {
     }
 
     #[test]
-    fn empty_user_id_is_rejected() {
+    fn empty_email_is_rejected() {
         let root = tempdir().unwrap();
-        assert!(VaultPaths::for_user(root.path(), "  ").is_err());
+        assert!(VaultPaths::for_email(root.path(), "  ").is_err());
     }
 }

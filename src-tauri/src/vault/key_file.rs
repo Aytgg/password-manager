@@ -94,15 +94,13 @@ mod tests {
         let path = directory.path().join("master-key.json");
         let master_key = generate_master_key();
 
-        let protected = protect_master_key(b"correct-password", &master_key)
+        let protected = protect_master_key(&[1u8; 32], &master_key)
             .expect("master key protection should succeed");
 
         save_protected_master_key(&path, &protected).expect("protected master key should be saved");
 
         let loaded =
             load_protected_master_key(&path).expect("protected master key should be loaded");
-
-        assert_eq!(loaded.salt, protected.salt);
         assert_eq!(loaded.nonce, protected.nonce);
         assert_eq!(loaded.ciphertext, protected.ciphertext);
         assert_eq!(loaded.kdf_version, protected.kdf_version);
@@ -116,17 +114,17 @@ mod tests {
         let path = directory.path().join("master-key.json");
         let master_key = generate_master_key();
 
-        let old = protect_master_key(b"old-password", &master_key).unwrap();
+        let old = protect_master_key(&[2u8; 32], &master_key).unwrap();
         save_protected_master_key(&path, &old).unwrap();
 
-        let new = protect_master_key(b"new-password", &master_key).unwrap();
+        let new = protect_master_key(&[3u8; 32], &master_key).unwrap();
         replace_protected_master_key(&path, &new).unwrap();
 
         let loaded = load_protected_master_key(&path).unwrap();
 
-        assert!(unlock_master_key(b"old-password", &loaded).is_err());
+        assert!(unlock_master_key(&[2u8; 32], &loaded).is_err());
         assert_eq!(
-            unlock_master_key(b"new-password", &loaded).unwrap().as_ref(),
+            unlock_master_key(&[3u8; 32], &loaded).unwrap().as_ref(),
             master_key.as_ref()
         );
 
@@ -141,7 +139,7 @@ mod tests {
     fn replacing_requires_an_existing_master_key_file() {
         let directory = tempfile::tempdir().expect("temporary directory should be created");
         let path = directory.path().join("master-key.json");
-        let protected = protect_master_key(b"password", &generate_master_key()).unwrap();
+        let protected = protect_master_key(&[4u8; 32], &generate_master_key()).unwrap();
 
         assert!(replace_protected_master_key(&path, &protected).is_err());
         assert!(!path.exists());
@@ -154,7 +152,7 @@ mod tests {
         let path = directory.path().join("master-key.json");
         let master_key = generate_master_key();
 
-        let protected = protect_master_key(b"correct-password", &master_key)
+        let protected = protect_master_key(&[1u8; 32], &master_key)
             .expect("master key protection should succeed");
 
         save_protected_master_key(&path, &protected).expect("first save should succeed");

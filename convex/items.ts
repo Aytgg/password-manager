@@ -1,12 +1,14 @@
 import { ConvexError, v } from "convex/values";
 
 import type { Doc, Id } from "./_generated/dataModel";
-import type { QueryCtx } from "./_generated/server";
+import type { MutationCtx, QueryCtx } from "./_generated/server";
 import { mutation, query } from "./_generated/server";
 import {
-  allowedUsers,
   assertSealedField,
   assertWrappedKey,
+  currentDepartmentKey,
+  directRecipients,
+  itemGrants,
   removeDisallowedAccess,
   requireActiveUser,
 } from "./lib";
@@ -14,9 +16,16 @@ import { sealedField, wrappedKey } from "./schema";
 
 const ITEM_ID = /^item-[0-9a-f]{32}$/;
 
+const userAccess = v.object({ userId: v.id("users"), access: wrappedKey });
+const departmentAccess = v.object({
+  departmentId: v.id("departments"),
+  keyVersion: v.number(),
+  access: wrappedKey,
+});
+
 async function requireOwnedItem(
   ctx: QueryCtx,
-  ownerId: string,
+  ownerId: Id<"users">,
   id: Id<"items">,
 ) {
   const item = await ctx.db.get(id);
@@ -36,14 +45,35 @@ function requireKeyVersion(item: Doc<"items">, expected: number) {
   }
 }
 
-async function myAccess(ctx: QueryCtx, itemId: Id<"items">, userId: string) {
+async function myAccess(ctx: QueryCtx, itemId: Id<"items">, userId: Id<"users">) {
   return await ctx.db
     .query("itemAccess")
     .withIndex("by_item_and_user", (q) => q.eq("item", itemId).eq("userId", userId))
     .unique();
 }
 
-function serialize(item: Doc<"items">, access: Doc<"itemAccess">, userId: string) {
+async function departmentAccessRow(
+  ctx: QueryCtx,
+  itemId: Id<"items">,
+  departmentId: Id<"departments">,
+) {
+  return await ctx.db
+    .query("itemDepartmentAccess")
+    .withIndex("by_item_and_department", (q) =>
+      q.eq("item", itemId).eq("department", departmentId),
+    )
+    .unique();
+}
+
+type KeyPath =
+  | { kind: "direct"; access: Doc<"itemAccess">["access"] }
+  | {
+      kind: "department";
+      departmentKey: Doc<"departmentKeys">["access"];
+      itemKey: Doc<"itemDepartmentAccess">["access"];
+    };
+
+function serialize(item: Doc<"items">, access: KeyPath, userId: Id<"users">) {
   return {
     id: item._id,
     itemId: item.itemId,
@@ -54,33 +84,59 @@ function serialize(item: Doc<"items">, access: Doc<"itemAccess">, userId: string
     keyVersion: item.keyVersion,
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
-    access: access.access,
+    access,
   };
 }
 
 /**
- * Kullanıcının anahtarına sahip olduğu kayıtlar ve her biri için kullanıcının
- * kendi paketlenmiş anahtarı.
+ * Kullanıcının açabildiği kayıtlar ve her birine ulaşma yolu: doğrudan
+ * kendisine paketlenmiş DEK ya da departmanının anahtarı üzerinden.
  */
 export const listMine = query({
   args: {},
   handler: async (ctx) => {
     const user = await requireActiveUser(ctx);
-    const userId = user.clerkId!;
+    const results = new Map<Id<"items">, ReturnType<typeof serialize>>();
 
-    const accesses = await ctx.db
+    for (const access of await ctx.db
       .query("itemAccess")
-      .withIndex("by_user", (q) => q.eq("userId", userId))
-      .collect();
+      .withIndex("by_user", (q) => q.eq("userId", user._id))
+      .collect()) {
+      const item = await ctx.db.get(access.item);
 
-    const results = await Promise.all(
-      accesses.map(async (access) => {
-        const item = await ctx.db.get(access.item);
-        return item ? serialize(item, access, userId) : null;
-      }),
-    );
+      if (item) {
+        results.set(item._id, serialize(item, { kind: "direct", access: access.access }, user._id));
+      }
+    }
 
-    return results.filter((item) => item !== null);
+    const department = user.departmentId ? await ctx.db.get(user.departmentId) : null;
+    const departmentKey = department ? await currentDepartmentKey(ctx, department, user._id) : null;
+
+    if (department && departmentKey) {
+      for (const row of await ctx.db
+        .query("itemDepartmentAccess")
+        .withIndex("by_department", (q) => q.eq("department", department._id))
+        .collect()) {
+        if (row.keyVersion !== department.keyVersion || results.has(row.item)) {
+          continue;
+        }
+
+        const item = await ctx.db.get(row.item);
+
+        if (item) {
+          results.set(
+            item._id,
+            serialize(
+              item,
+              { kind: "department", departmentKey: departmentKey.access, itemKey: row.access },
+              user._id,
+            ),
+          );
+        }
+      }
+    }
+
+    return [...results.values()];
   },
 });
 
@@ -93,7 +149,6 @@ export const create = mutation({
   },
   handler: async (ctx, args) => {
     const user = await requireActiveUser(ctx);
-    const ownerId = user.clerkId!;
 
     if (!user.publicKey) {
       throw new ConvexError("Önce kasanın açık anahtarı kaydedilmeli.");
@@ -120,7 +175,7 @@ export const create = mutation({
 
     const id = await ctx.db.insert("items", {
       itemId: args.itemId,
-      ownerId,
+      ownerId: user._id,
       metadata: args.metadata,
       secret: args.secret,
       keyVersion: 1,
@@ -131,7 +186,7 @@ export const create = mutation({
 
     await ctx.db.insert("itemAccess", {
       item: id,
-      userId: ownerId,
+      userId: user._id,
       access: args.ownerAccess,
     });
 
@@ -144,21 +199,10 @@ export const sharing = query({
   args: { id: v.id("items") },
   handler: async (ctx, args) => {
     const user = await requireActiveUser(ctx);
-    const item = await requireOwnedItem(ctx, user.clerkId!, args.id);
+    const item = await requireOwnedItem(ctx, user._id, args.id);
+    const grants = await itemGrants(ctx, item._id);
 
-    const grants = await ctx.db
-      .query("itemGrants")
-      .withIndex("by_item", (q) => q.eq("item", item._id))
-      .collect();
-
-    const grantedDepartments = new Set(
-      grants.flatMap((grant) => (grant.departmentId ? [grant.departmentId] : [])),
-    );
-    const grantedUsers = new Set(
-      grants.flatMap((grant) => (grant.userId ? [grant.userId] : [])),
-    );
-
-    const accessUserIds = new Set(
+    const directKeyUserIds = new Set(
       (
         await ctx.db
           .query("itemAccess")
@@ -170,46 +214,66 @@ export const sharing = query({
     const departments = await ctx.db.query("departments").collect();
     const departmentNames = new Map(departments.map((d) => [d._id, d.name]));
 
+    // Departmanı üzerinden anahtarı hazır olan: departman anahtarını tutan ve
+    // kaydın departmana paketi güncel olan.
+    const departmentReady = new Map<Id<"departments">, boolean>();
+    for (const department of departments) {
+      const row = await departmentAccessRow(ctx, item._id, department._id);
+      departmentReady.set(
+        department._id,
+        department.keyVersion > 0 && row?.keyVersion === department.keyVersion,
+      );
+    }
+
     const users = (await ctx.db.query("users").collect()).filter(
-      (candidate) =>
-        candidate.status === "active" &&
-        candidate.clerkId !== undefined &&
-        candidate.clerkId !== user.clerkId,
+      (candidate) => candidate.status !== "disabled" && candidate._id !== user._id,
     );
+
+    const result = [];
+
+    for (const candidate of users) {
+      const viaDepartment =
+        candidate.departmentId !== undefined && grants.departmentIds.has(candidate.departmentId);
+
+      const hasDepartmentKey =
+        viaDepartment &&
+        departmentReady.get(candidate.departmentId!) === true &&
+        (await currentDepartmentKey(ctx, (await ctx.db.get(candidate.departmentId!))!, candidate._id)) !==
+          null;
+
+      result.push({
+        userId: candidate._id,
+        email: candidate.email,
+        displayName: candidate.displayName ?? candidate.email,
+        status: candidate.status,
+        departmentName: candidate.departmentId
+          ? (departmentNames.get(candidate.departmentId) ?? null)
+          : null,
+        direct: grants.userIds.has(candidate._id),
+        viaDepartment,
+        hasKey: directKeyUserIds.has(candidate._id) || hasDepartmentKey,
+        hasPublicKey: candidate.publicKey !== undefined,
+      });
+    }
 
     return {
       departments: departments
         .map((department) => ({
           id: department._id,
           name: department.name,
-          granted: grantedDepartments.has(department._id),
+          granted: grants.departmentIds.has(department._id),
         }))
         .sort((a, b) => a.name.localeCompare(b.name, "tr")),
-      users: users
-        .map((candidate) => ({
-          userId: candidate.clerkId!,
-          email: candidate.email,
-          displayName: candidate.displayName ?? candidate.email,
-          departmentName: candidate.departmentId
-            ? (departmentNames.get(candidate.departmentId) ?? null)
-            : null,
-          direct: grantedUsers.has(candidate.clerkId!),
-          viaDepartment:
-            candidate.departmentId !== undefined &&
-            grantedDepartments.has(candidate.departmentId),
-          hasKey: accessUserIds.has(candidate.clerkId!),
-          hasPublicKey: candidate.publicKey !== undefined,
-        }))
-        .sort((a, b) => a.displayName.localeCompare(b.displayName, "tr")),
+      users: result.sort((a, b) => a.displayName.localeCompare(b.displayName, "tr")),
     };
   },
 });
 
 export const setUserGrant = mutation({
-  args: { id: v.id("items"), userId: v.string(), granted: v.boolean() },
+  args: { id: v.id("items"), userId: v.id("users"), granted: v.boolean() },
   handler: async (ctx, args) => {
     const user = await requireActiveUser(ctx);
-    const item = await requireOwnedItem(ctx, user.clerkId!, args.id);
+    const item = await requireOwnedItem(ctx, user._id, args.id);
 
     if (args.userId === item.ownerId) {
       throw new ConvexError("Parola sahibinin erişimi değiştirilemez.");
@@ -227,12 +291,9 @@ export const setUserGrant = mutation({
         return;
       }
 
-      const recipient = await ctx.db
-        .query("users")
-        .withIndex("by_clerk_id", (q) => q.eq("clerkId", args.userId))
-        .unique();
+      const recipient = await ctx.db.get(args.userId);
 
-      if (!recipient || recipient.status !== "active") {
+      if (!recipient || recipient.status === "disabled") {
         throw new ConvexError("Yetki verilecek kullanıcı bulunamadı.");
       }
 
@@ -255,7 +316,7 @@ export const setDepartmentGrant = mutation({
   },
   handler: async (ctx, args) => {
     const user = await requireActiveUser(ctx);
-    const item = await requireOwnedItem(ctx, user.clerkId!, args.id);
+    const item = await requireOwnedItem(ctx, user._id, args.id);
 
     if (!(await ctx.db.get(args.departmentId))) {
       throw new ConvexError("Departman bulunamadı.");
@@ -285,33 +346,73 @@ export const setDepartmentGrant = mutation({
   },
 });
 
+/** Departman paketinin, departmanın güncel anahtarına ve paylaşım kuralına
+ * uyduğunu doğrular. */
+async function checkDepartmentAccess(
+  ctx: QueryCtx,
+  item: Doc<"items">,
+  granted: Set<Id<"departments">>,
+  entry: { departmentId: Id<"departments">; keyVersion: number },
+) {
+  if (!granted.has(entry.departmentId)) {
+    throw new ConvexError("Paylaşım kuralı bu departmana erişim vermiyor.");
+  }
+
+  const department = await ctx.db.get(entry.departmentId);
+
+  if (!department || department.keyVersion === 0 || department.keyVersion !== entry.keyVersion) {
+    throw new ConvexError("Departman anahtarı değişti. Tekrar deneniyor.");
+  }
+}
+
+async function upsertDepartmentAccess(
+  ctx: MutationCtx,
+  itemId: Id<"items">,
+  entry: { departmentId: Id<"departments">; keyVersion: number; access: Doc<"itemDepartmentAccess">["access"] },
+) {
+  const existing = await departmentAccessRow(ctx, itemId, entry.departmentId);
+
+  if (existing) {
+    await ctx.db.patch(existing._id, { keyVersion: entry.keyVersion, access: entry.access });
+  } else {
+    await ctx.db.insert("itemDepartmentAccess", {
+      item: itemId,
+      department: entry.departmentId,
+      keyVersion: entry.keyVersion,
+      access: entry.access,
+    });
+  }
+}
+
 /**
- * Kurala göre erişimi olması gereken fakat anahtarı eksik kullanıcılar için,
- * kayda erişimi olan bir istemcinin ürettiği anahtar paketlerini ekler.
- * Zaten anahtarı olan kullanıcılar sessizce atlanır.
+ * Kurala göre anahtar paketi eksik olan kullanıcılar ve departmanlar için,
+ * kayda doğrudan erişimi olan bir istemcinin ürettiği paketleri ekler.
+ * Zaten paketi olanlar sessizce atlanır.
  */
 export const addAccesses = mutation({
   args: {
     id: v.id("items"),
     keyVersion: v.number(),
-    accesses: v.array(v.object({ userId: v.string(), access: wrappedKey })),
+    accesses: v.array(userAccess),
+    departmentAccesses: v.array(departmentAccess),
   },
   handler: async (ctx, args) => {
     const user = await requireActiveUser(ctx);
     const item = await ctx.db.get(args.id);
 
-    if (!item || !(await myAccess(ctx, args.id, user.clerkId!))) {
+    if (!item || !(await myAccess(ctx, args.id, user._id))) {
       throw new ConvexError("Bu parolaya erişimin yok.");
     }
 
     requireKeyVersion(item, args.keyVersion);
 
-    const allowed = await allowedUsers(ctx, item);
+    const recipients = await directRecipients(ctx, item);
+    const { departmentIds } = await itemGrants(ctx, item._id);
 
     for (const entry of args.accesses) {
       assertWrappedKey(entry.access);
 
-      if (!allowed.has(entry.userId)) {
+      if (!recipients.has(entry.userId)) {
         throw new ConvexError("Paylaşım kuralı bu kullanıcıya erişim vermiyor.");
       }
 
@@ -325,13 +426,27 @@ export const addAccesses = mutation({
         access: entry.access,
       });
     }
+
+    for (const entry of args.departmentAccesses) {
+      assertWrappedKey(entry.access);
+      await checkDepartmentAccess(ctx, item, departmentIds, entry);
+
+      const existing = await departmentAccessRow(ctx, item._id, entry.departmentId);
+
+      if (existing?.keyVersion === entry.keyVersion) {
+        continue;
+      }
+
+      await upsertDepartmentAccess(ctx, item._id, entry);
+    }
   },
 });
 
 /**
- * Kaydı yeni bir DEK ile şifrelenmiş haliyle değiştirir ve anahtar
- * paketlerini `accesses` ile değiştirir. Yalnızca sahip yapabilir; listedeki
- * herkesin kurala göre erişimi olmalıdır.
+ * Kaydı yeni bir DEK ile şifrelenmiş haliyle değiştirir ve bütün anahtar
+ * paketlerini yeniler. Yalnızca sahip yapabilir; kişi listesindeki herkesin
+ * kurala göre erişimi olmalı ve anahtarı hazır her paylaşılan departman
+ * listede bulunmalıdır.
  */
 export const rekey = mutation({
   args: {
@@ -339,19 +454,20 @@ export const rekey = mutation({
     keyVersion: v.number(),
     metadata: sealedField,
     secret: sealedField,
-    accesses: v.array(v.object({ userId: v.string(), access: wrappedKey })),
+    accesses: v.array(userAccess),
+    departmentAccesses: v.array(departmentAccess),
   },
   handler: async (ctx, args) => {
     const user = await requireActiveUser(ctx);
-    const ownerId = user.clerkId!;
-    const item = await requireOwnedItem(ctx, ownerId, args.id);
+    const item = await requireOwnedItem(ctx, user._id, args.id);
 
     requireKeyVersion(item, args.keyVersion);
     assertSealedField(args.metadata);
     assertSealedField(args.secret);
 
-    const allowed = await allowedUsers(ctx, item);
-    const seen = new Set<string>();
+    const recipients = await directRecipients(ctx, item);
+    const { departmentIds } = await itemGrants(ctx, item._id);
+    const seen = new Set<Id<"users">>();
 
     for (const entry of args.accesses) {
       assertWrappedKey(entry.access);
@@ -360,15 +476,38 @@ export const rekey = mutation({
         throw new ConvexError("Erişim listesinde tekrar eden kullanıcı var.");
       }
 
-      if (!allowed.has(entry.userId)) {
+      if (!recipients.has(entry.userId)) {
         throw new ConvexError("Paylaşım kuralı bu kullanıcıya erişim vermiyor.");
       }
 
       seen.add(entry.userId);
     }
 
-    if (!seen.has(ownerId)) {
+    if (!seen.has(user._id)) {
       throw new ConvexError("Parola sahibinin erişimi kaldırılamaz.");
+    }
+
+    const seenDepartments = new Set<Id<"departments">>();
+
+    for (const entry of args.departmentAccesses) {
+      assertWrappedKey(entry.access);
+
+      if (seenDepartments.has(entry.departmentId)) {
+        throw new ConvexError("Erişim listesinde tekrar eden departman var.");
+      }
+
+      await checkDepartmentAccess(ctx, item, departmentIds, entry);
+      seenDepartments.add(entry.departmentId);
+    }
+
+    // Anahtarı hazır bir departman listede yoksa o departman erişimini
+    // kaybederdi.
+    for (const departmentId of departmentIds) {
+      const department = await ctx.db.get(departmentId);
+
+      if (department && department.keyVersion > 0 && !seenDepartments.has(departmentId)) {
+        throw new ConvexError("Paylaşılan bir departmanın anahtarı eksik. Tekrar deneniyor.");
+      }
     }
 
     await ctx.db.patch(item._id, {
@@ -379,12 +518,17 @@ export const rekey = mutation({
       updatedAt: Date.now(),
     });
 
-    const currentAccesses = await ctx.db
+    for (const access of await ctx.db
       .query("itemAccess")
       .withIndex("by_item", (q) => q.eq("item", item._id))
-      .collect();
+      .collect()) {
+      await ctx.db.delete(access._id);
+    }
 
-    for (const access of currentAccesses) {
+    for (const access of await ctx.db
+      .query("itemDepartmentAccess")
+      .withIndex("by_item", (q) => q.eq("item", item._id))
+      .collect()) {
       await ctx.db.delete(access._id);
     }
 
@@ -395,39 +539,41 @@ export const rekey = mutation({
         access: entry.access,
       });
     }
+
+    for (const entry of args.departmentAccesses) {
+      await upsertDepartmentAccess(ctx, item._id, entry);
+    }
   },
 });
 
 /**
- * İstemcinin arka planda yapması gereken şifreleme işleri:
- * - fills: erişimim olan kayıtlarda, kurala göre erişimi olup anahtarı
- *   eksik kullanıcılar (anahtarı ben paketlerim).
+ * Kayıtlarla ilgili, istemcinin arka planda yapması gereken şifreleme işleri:
+ * - fills: doğrudan erişimim olan kayıtlarda, kurala göre paketi eksik
+ *   kullanıcılar ve departmanlar (paketleri ben üretirim).
  * - rekeys: sahibi olduğum ve erişimi kaldırılmış kayıtlar (yeni DEK).
  */
 export const pendingWork = query({
   args: {},
   handler: async (ctx) => {
     const user = await requireActiveUser(ctx);
-    const userId = user.clerkId!;
-
-    const accesses = await ctx.db
-      .query("itemAccess")
-      .withIndex("by_user", (q) => q.eq("userId", userId))
-      .collect();
 
     const fills = [];
     const rekeys = [];
 
-    for (const access of accesses) {
+    for (const access of await ctx.db
+      .query("itemAccess")
+      .withIndex("by_user", (q) => q.eq("userId", user._id))
+      .collect()) {
       const item = await ctx.db.get(access.item);
 
       if (!item) {
         continue;
       }
 
-      const allowed = await allowedUsers(ctx, item);
+      const recipients = await directRecipients(ctx, item);
+      const { departmentIds } = await itemGrants(ctx, item._id);
 
-      const current = new Set(
+      const currentUsers = new Set(
         (
           await ctx.db
             .query("itemAccess")
@@ -436,13 +582,36 @@ export const pendingWork = query({
         ).map((row) => row.userId),
       );
 
+      const departments = [];
+      for (const departmentId of departmentIds) {
+        const department = await ctx.db.get(departmentId);
+
+        if (department && department.keyVersion > 0 && department.publicKey) {
+          departments.push({
+            departmentId,
+            keyVersion: department.keyVersion,
+            publicKey: department.publicKey,
+            hasCurrentKey:
+              (await departmentAccessRow(ctx, item._id, departmentId))?.keyVersion ===
+              department.keyVersion,
+          });
+        }
+      }
+
+      const serialized = serialize(item, { kind: "direct", access: access.access }, user._id);
+
       if (item.needsRekey) {
-        if (item.ownerId === userId) {
+        if (item.ownerId === user._id) {
           rekeys.push({
-            item: serialize(item, access, userId),
-            recipients: [...current]
-              .filter((id) => id !== userId && allowed.has(id))
-              .map((id) => ({ userId: id, publicKey: allowed.get(id)!.publicKey })),
+            item: serialized,
+            recipients: [...currentUsers]
+              .filter((id) => id !== user._id && recipients.has(id))
+              .map((id) => ({ userId: id, publicKey: recipients.get(id)!.publicKey })),
+            departments: departments.map(({ departmentId, keyVersion, publicKey }) => ({
+              departmentId,
+              keyVersion,
+              publicKey,
+            })),
           });
         }
 
@@ -451,16 +620,22 @@ export const pendingWork = query({
         continue;
       }
 
-      const missing = [...allowed.values()].filter(
-        (candidate) => !current.has(candidate.clerkId),
+      const missingUsers = [...recipients.values()].filter(
+        (candidate) => !currentUsers.has(candidate._id),
       );
+      const missingDepartments = departments.filter((department) => !department.hasCurrentKey);
 
-      if (missing.length > 0) {
+      if (missingUsers.length > 0 || missingDepartments.length > 0) {
         fills.push({
-          item: serialize(item, access, userId),
-          recipients: missing.map((candidate) => ({
-            userId: candidate.clerkId,
+          item: serialized,
+          recipients: missingUsers.map((candidate) => ({
+            userId: candidate._id,
             publicKey: candidate.publicKey,
+          })),
+          departments: missingDepartments.map(({ departmentId, keyVersion, publicKey }) => ({
+            departmentId,
+            keyVersion,
+            publicKey,
           })),
         });
       }
@@ -470,44 +645,46 @@ export const pendingWork = query({
   },
 });
 
-// Paylaşım kuralı gereği kullanıcının görmesi gereken fakat anahtarı henüz
-// paketlenmemiş kayıtların sayısı. Anahtarı yalnızca kayda erişimi olan bir
-// istemci paketleyebildiği için bu kayıtlar o kişi çevrimiçi olunca açılır.
+// Paylaşım kuralı gereği kullanıcının görmesi gereken fakat anahtarına henüz
+// ulaşamadığı kayıtların sayısı. Paketler, işlemi yapan kişinin cihazında
+// birkaç saniye içinde üretilir; uzun sürerse ilgili kişi çevrimdışıdır.
 export const pendingSharedCount = query({
   args: {},
   handler: async (ctx) => {
     const user = await requireActiveUser(ctx);
-    const userId = user.clerkId!;
+
+    const department = user.departmentId ? await ctx.db.get(user.departmentId) : null;
+    const departmentKey = department ? await currentDepartmentKey(ctx, department, user._id) : null;
 
     const grants = [
       ...(await ctx.db
         .query("itemGrants")
-        .withIndex("by_user", (q) => q.eq("userId", userId))
+        .withIndex("by_user", (q) => q.eq("userId", user._id))
         .collect()),
-      ...(user.departmentId
+      ...(department
         ? await ctx.db
             .query("itemGrants")
-            .withIndex("by_department", (q) => q.eq("departmentId", user.departmentId))
+            .withIndex("by_department", (q) => q.eq("departmentId", department._id))
             .collect()
         : []),
     ];
 
-    const itemIds = new Set(grants.map((grant) => grant.item));
     let count = 0;
 
-    for (const itemId of itemIds) {
+    for (const itemId of new Set(grants.map((grant) => grant.item))) {
       const item = await ctx.db.get(itemId);
 
-      if (!item || item.ownerId === userId) {
+      if (!item || item.ownerId === user._id || (await myAccess(ctx, itemId, user._id))) {
         continue;
       }
 
-      const access = await ctx.db
-        .query("itemAccess")
-        .withIndex("by_item_and_user", (q) => q.eq("item", itemId).eq("userId", userId))
-        .unique();
+      const viaDepartment =
+        department !== null &&
+        departmentKey !== null &&
+        (await departmentAccessRow(ctx, itemId, department._id))?.keyVersion ===
+          department.keyVersion;
 
-      if (!access) {
+      if (!viaDepartment) {
         count += 1;
       }
     }

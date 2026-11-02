@@ -3,6 +3,7 @@ use crate::crypto::identity::IdentityKeyPair;
 use super::KeyStore;
 
 pub(super) const IDENTITY_PRIVATE_KEY_PREFIX: &str = "identity-private-key";
+const INVITE_IDENTITY_PREFIX: &str = "invite-identity";
 
 pub struct LoadedIdentity {
     pub identity: IdentityKeyPair,
@@ -62,6 +63,36 @@ pub fn load_or_create_identity<K: KeyStore>(
             })
         }
     }
+}
+
+/// Kayıt sırasında davet kodundan türetilen geçici kimlik, ona paketlenmiş
+/// anahtarlar kalıcı kimliğe taşınana kadar kasada saklanır. Böylece taşıma
+/// yarıda kalırsa (ör. bağlantı koptu) sonraki girişte devam edilebilir.
+pub fn save_invite_identity<K: KeyStore>(
+    store: &K,
+    user_id: &str,
+    identity: &IdentityKeyPair,
+) -> Result<(), String> {
+    store.save(&format!("{INVITE_IDENTITY_PREFIX}:{user_id}"), identity.private_key())
+}
+
+pub fn load_invite_identity<K: KeyStore>(
+    store: &K,
+    user_id: &str,
+) -> Result<Option<IdentityKeyPair>, String> {
+    store
+        .load(&format!("{INVITE_IDENTITY_PREFIX}:{user_id}"))?
+        .map(|bytes| {
+            let private_bytes: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| "Invalid invite identity length".to_string())?;
+            Ok(IdentityKeyPair::from_private_key(private_bytes))
+        })
+        .transpose()
+}
+
+pub fn delete_invite_identity<K: KeyStore>(store: &K, user_id: &str) -> Result<(), String> {
+    store.delete(&format!("{INVITE_IDENTITY_PREFIX}:{user_id}"))
 }
 
 #[cfg(test)]

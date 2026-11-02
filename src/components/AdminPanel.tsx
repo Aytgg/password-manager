@@ -1,4 +1,5 @@
-import { useAction, useMutation, useQuery } from "convex/react";
+import { invoke } from "@tauri-apps/api/core";
+import { useMutation, useQuery } from "convex/react";
 import type { FunctionReturnType } from "convex/server";
 import { useState } from "react";
 import type React from "react";
@@ -17,6 +18,21 @@ export const ROLE_LABELS: Record<Role, string> = {
   manager: "Departman Yöneticisi",
   member: "Personel",
 };
+
+// Sunucudaki `INVITE_TTL_HOURS` ile aynı.
+const INVITE_DURATIONS = [
+  { hours: 24, label: "24 saat" },
+  { hours: 72, label: "3 gün" },
+  { hours: 168, label: "7 gün" },
+];
+
+type PreparedInvite = { code: string; publicKey: string; verifier: string };
+
+/** Davet kodunu bu cihazda üretir; sunucuya yalnızca koddan türetilen açık
+ * anahtar ve doğrulayıcı gider. */
+async function prepareInvite(email: string) {
+  return await invoke<PreparedInvite>("prepare_invite", { email: email.trim().toLowerCase() });
+}
 
 const STATUS_LABELS = {
   invited: "Davet edildi",
@@ -76,7 +92,8 @@ export default function AdminPanel({ me }: { me: Me }) {
 
   const createDepartment = useMutation(api.departments.create);
   const createDefaultDepartments = useMutation(api.departments.createDefaults);
-  const inviteMember = useAction(api.members.invite);
+  const inviteMember = useMutation(api.members.invite);
+  const renewInvite = useMutation(api.members.renewInvite);
   const updateMember = useMutation(api.members.update);
 
   const [departmentName, setDepartmentName] = useState("");
@@ -85,6 +102,14 @@ export default function AdminPanel({ me }: { me: Me }) {
   const [inviteDepartmentId, setInviteDepartmentId] = useState<string>(
     me.departmentId ?? "",
   );
+  const [inviteHours, setInviteHours] = useState(168);
+
+  // Davet kodu yalnızca üretildiği anda gösterilir; sunucuda özeti tutulur.
+  const [issuedInvite, setIssuedInvite] = useState<{
+    email: string;
+    code: string;
+    expiresAt: number;
+  } | null>(null);
 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
@@ -202,16 +227,25 @@ export default function AdminPanel({ me }: { me: Me }) {
           onSubmit={(event) => {
             event.preventDefault();
             void run(async () => {
-              await inviteMember({
+              const prepared = await prepareInvite(inviteEmail);
+              const { expiresAt } = await inviteMember({
                 email: inviteEmail,
                 role: inviteRole,
                 departmentId:
                   inviteRole === "admin" && !inviteDepartmentId
                     ? undefined
                     : (inviteDepartmentId as Id<"departments">),
+                publicKey: prepared.publicKey,
+                verifier: prepared.verifier,
+                expiresInHours: inviteHours,
+              });
+              setIssuedInvite({
+                email: inviteEmail.trim().toLowerCase(),
+                code: prepared.code,
+                expiresAt,
               });
               setInviteEmail("");
-            }, "Davet e-postası gönderildi.");
+            }, "Kullanıcı davet edildi.");
           }}
         >
           <input
@@ -253,14 +287,70 @@ export default function AdminPanel({ me }: { me: Me }) {
             </select>
           )}
 
+          <select
+            style={styles.input}
+            value={inviteHours}
+            onChange={(event) => setInviteHours(Number(event.target.value))}
+            aria-label="Davetin geçerlilik süresi"
+          >
+            {INVITE_DURATIONS.map((duration) => (
+              <option key={duration.hours} value={duration.hours}>
+                {duration.label}
+              </option>
+            ))}
+          </select>
+
           <button
             type="submit"
             style={styles.button}
             disabled={busy || (!hasDepartments && inviteRole !== "admin")}
           >
-            Davet gönder
+            Davet et
           </button>
         </form>
+
+        {issuedInvite && (
+          <div
+            role="status"
+            style={{
+              marginBottom: 20,
+              padding: 14,
+              border: "1px solid #3b3151",
+              borderRadius: 10,
+              background: "#191422",
+            }}
+          >
+            <div style={styles.muted}>
+              {issuedInvite.email} için davet kodu (
+              {new Date(issuedInvite.expiresAt).toLocaleDateString("tr-TR")} tarihine kadar
+              geçerli):
+            </div>
+            <div style={{ ...styles.row, marginTop: 8 }}>
+              <code style={{ fontSize: 18, letterSpacing: 2 }}>{issuedInvite.code}</code>
+              <button
+                type="button"
+                style={styles.secondaryButton}
+                onClick={() => void navigator.clipboard.writeText(issuedInvite.code)}
+              >
+                Kopyala
+              </button>
+              <button
+                type="button"
+                style={styles.secondaryButton}
+                onClick={() => setIssuedInvite(null)}
+              >
+                Kapat
+              </button>
+            </div>
+            <div style={{ ...styles.muted, marginTop: 8 }}>
+              Kodu kullanıcıya güvenli bir kanaldan ilet; bu ekran kapanınca tekrar
+              gösterilemez, sunucuda da saklanmaz. Kullanıcı uygulamada “Davet kodum
+              var” ile kaydolur. Kaydolmadan önce de ona şifre paylaşabilirsin; kodu
+              bilen biri kayıttan önceki paylaşımları açabileceği için kodu yalnızca
+              kullanıcıya ilet.
+            </div>
+          </div>
+        )}
 
         {members === undefined ? (
           <p style={styles.muted}>Yükleniyor...</p>
@@ -286,6 +376,9 @@ export default function AdminPanel({ me }: { me: Me }) {
                     {member.status === "active" &&
                       !member.hasPublicKey &&
                       " · kasasını henüz açmadı"}
+                    {member.inviteExpiresAt !== null &&
+                      member.inviteExpiresAt < Date.now() &&
+                      " · davet süresi doldu"}
                   </div>
                 </div>
 
@@ -334,6 +427,28 @@ export default function AdminPanel({ me }: { me: Me }) {
                     <option value="manager">{ROLE_LABELS.manager}</option>
                     <option value="admin">{ROLE_LABELS.admin}</option>
                   </select>
+
+                  {member.canManage && member.status === "invited" && (
+                    <button
+                      type="button"
+                      style={styles.secondaryButton}
+                      disabled={busy}
+                      onClick={() =>
+                        void run(async () => {
+                          const prepared = await prepareInvite(member.email);
+                          const { expiresAt } = await renewInvite({
+                            id: member.id,
+                            publicKey: prepared.publicKey,
+                            verifier: prepared.verifier,
+                            expiresInHours: inviteHours,
+                          });
+                          setIssuedInvite({ email: member.email, code: prepared.code, expiresAt });
+                        }, "Yeni davet kodu üretildi; eski kod geçersiz.")
+                      }
+                    >
+                      Yeni davet kodu
+                    </button>
+                  )}
 
                   {member.canManage && (
                     <button

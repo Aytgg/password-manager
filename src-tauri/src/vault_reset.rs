@@ -2,7 +2,6 @@ use std::sync::Arc;
 
 use tauri::Manager;
 
-use crate::auth::authenticated_user_id;
 use crate::vault::{paths::VaultPaths, session::VaultSession};
 
 fn remove_file_if_exists(path: &std::path::Path) -> Result<(), String> {
@@ -16,14 +15,14 @@ fn remove_file_if_exists(path: &std::path::Path) -> Result<(), String> {
     }
 }
 
-/// Development-only command that discards the authenticated user's local
-/// vault on this device. Other accounts' vaults are left untouched.
+/// Development-only command that discards the given account's local vault
+/// on this device. Other accounts' vaults are left untouched.
 /// Release builds always refuse to execute this operation.
 #[tauri::command]
 pub fn reset_vault(
     app: tauri::AppHandle,
     session: tauri::State<'_, Arc<VaultSession>>,
-    session_token: String,
+    email: String,
 ) -> Result<(), String> {
     if !cfg!(debug_assertions) {
         return Err(
@@ -31,8 +30,6 @@ pub fn reset_vault(
                 .to_string(),
         );
     }
-
-    let user_id = authenticated_user_id(&session_token)?;
 
     // Lock and release the database/Stronghold runtime before deleting files.
     session.lock()?;
@@ -42,7 +39,7 @@ pub fn reset_vault(
         .app_data_dir()
         .map_err(|error| error.to_string())?;
 
-    let paths = VaultPaths::for_user(&app_data_dir, &user_id)?;
+    let paths = VaultPaths::for_email(&app_data_dir, &email)?;
 
     for path in paths.all_files() {
         remove_file_if_exists(path)?;

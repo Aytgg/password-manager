@@ -1,7 +1,7 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import type React from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { useConvexAuth, useMutation, useQuery } from "convex/react";
+import { useMutation, useQuery } from "convex/react";
 import type { FunctionReturnType } from "convex/server";
 
 import { api } from "../convex/_generated/api";
@@ -18,12 +18,14 @@ type WrappedKey = {
   ciphertext: string;
 };
 
+// Rust tarafındaki `EncryptedItem`; `access` doğrudan ya da departman
+// anahtarı üzerinden DEK'e ulaşma yoludur.
 type EncryptedItem = {
   itemId: string;
   ownerId: string;
   metadata: SealedField;
   secret: SealedField;
-  access: WrappedKey;
+  access: ServerItem["access"];
 };
 
 type NewItem = {
@@ -31,12 +33,6 @@ type NewItem = {
   metadata: SealedField;
   secret: SealedField;
   ownerAccess: WrappedKey;
-};
-
-type RekeyedItem = {
-  metadata: SealedField;
-  secret: SealedField;
-  accesses: { userId: string; access: WrappedKey }[];
 };
 
 type DecryptedMetadata = {
@@ -55,8 +51,8 @@ type PasswordItem = {
 };
 
 type PasswordManagerProps = {
-  isUnlocked: boolean;
-  getSessionToken: () => Promise<string>;
+  /** Sunucu oturumu açık ve kasanın sahibiyle eşleşiyor. */
+  isServerReady: boolean;
 };
 
 function toEncryptedItem(item: ServerItem): EncryptedItem {
@@ -292,15 +288,18 @@ function SharingPanel({ id }: { id: Id<"items"> }) {
           const key = `user:${user.userId}`;
           const allowed = user.direct || user.viaDepartment;
 
-          const status = user.hasKey
+          const access = user.hasKey
             ? user.direct
               ? "Erişim açık"
               : "Departman üzerinden erişim açık"
             : allowed
-              ? user.hasPublicKey
-                ? "Anahtar hazırlanıyor..."
-                : "Kasasını ilk açtığında erişecek"
+              ? "Anahtar hazırlanıyor..."
               : "Erişim kapalı";
+
+          // Davet edilen kişi henüz kaydolmamış olsa da paylaşım yapılabilir;
+          // kaydolduğunda kimsenin çevrimiçi olması gerekmeden erişir.
+          const status =
+            user.status === "invited" ? `${access} · henüz kaydolmadı` : access;
 
           return (
             <div key={user.userId} style={styles.accessRow}>
@@ -345,27 +344,15 @@ function SharingPanel({ id }: { id: Id<"items"> }) {
   );
 }
 
-export default function PasswordManager({
-  isUnlocked,
-  getSessionToken,
-}: PasswordManagerProps) {
-  // Convex oturumu Clerk token'ı ile kurulana kadar sorgular bekletilir;
-  // aksi halde sunucu kimliksiz isteği reddeder.
-  const { isAuthenticated: isConvexAuthenticated, isLoading: isConvexAuthLoading } =
-    useConvexAuth();
-  const isReady = isUnlocked && isConvexAuthenticated;
-
+export default function PasswordManager({ isServerReady: isReady }: PasswordManagerProps) {
   // Convex sorguları canlıdır; sunucudaki değişiklikler otomatik gelir.
   const serverItems = useQuery(api.items.listMine, isReady ? {} : "skip");
-  const pendingWork = useQuery(api.items.pendingWork, isReady ? {} : "skip");
   const pendingSharedCount = useQuery(
     api.items.pendingSharedCount,
     isReady ? {} : "skip",
   );
 
   const createItem = useMutation(api.items.create);
-  const addAccesses = useMutation(api.items.addAccesses);
-  const rekeyItem = useMutation(api.items.rekey);
 
   const [metadataByItemId, setMetadataByItemId] = useState<
     Record<string, DecryptedMetadata>
@@ -379,7 +366,6 @@ export default function PasswordManager({
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
-  const [syncError, setSyncError] = useState("");
 
   const [copyingPasswordId, setCopyingPasswordId] = useState<string | null>(
     null,
@@ -403,7 +389,6 @@ export default function PasswordManager({
         const result = await invoke<DecryptedMetadata[]>(
           "decrypt_items_metadata",
           {
-            sessionToken: await getSessionToken(),
             items: serverItems!.map(toEncryptedItem),
           },
         );
@@ -425,93 +410,7 @@ export default function PasswordManager({
     return () => {
       cancelled = true;
     };
-  }, [decryptVersion, getSessionToken, isReady, serverItems]);
-
-  // Arka plan anahtar eşitlemesi: paylaşım kuralına göre erişimi olması
-  // gereken kişilere anahtar paketlenir; sahibi olunan ve erişimi
-  // kaldırılmış kayıtlar yeni bir DEK ile yeniden şifrelenir.
-  const syncRunningRef = useRef(false);
-  const [syncTick, setSyncTick] = useState(0);
-
-  useEffect(() => {
-    if (!isReady || !pendingWork || syncRunningRef.current) {
-      return;
-    }
-
-    if (pendingWork.fills.length === 0 && pendingWork.rekeys.length === 0) {
-      setSyncError("");
-      return;
-    }
-
-    syncRunningRef.current = true;
-
-    void (async () => {
-      let failed = false;
-
-      try {
-        const sessionToken = await getSessionToken();
-
-        for (const task of pendingWork.rekeys) {
-          try {
-            const rekeyed = await invoke<RekeyedItem>("rekey_item", {
-              sessionToken,
-              item: toEncryptedItem(task.item),
-              recipients: task.recipients,
-            });
-
-            await rekeyItem({
-              id: task.item.id,
-              keyVersion: task.item.keyVersion,
-              ...rekeyed,
-            });
-          } catch (err) {
-            failed = true;
-            setSyncError(`Yeniden şifreleme başarısız: ${errorMessage(err)}`);
-          }
-        }
-
-        for (const task of pendingWork.fills) {
-          try {
-            const accesses = [];
-
-            for (const recipient of task.recipients) {
-              const access = await invoke<WrappedKey>(
-                "wrap_item_key_for_recipient",
-                {
-                  sessionToken,
-                  item: toEncryptedItem(task.item),
-                  recipientPublicKey: recipient.publicKey,
-                },
-              );
-
-              accesses.push({ userId: recipient.userId, access });
-            }
-
-            await addAccesses({
-              id: task.item.id,
-              keyVersion: task.item.keyVersion,
-              accesses,
-            });
-          } catch (err) {
-            failed = true;
-            setSyncError(`Anahtar paylaşımı başarısız: ${errorMessage(err)}`);
-          }
-        }
-      } catch (err) {
-        failed = true;
-        setSyncError(errorMessage(err));
-      } finally {
-        syncRunningRef.current = false;
-
-        // Çalışırken gelen yeni işler için tekrar kontrol et. Hata olduysa
-        // sonsuz döngüye girmemek için bir sonraki sunucu değişikliğini bekle.
-        if (!failed) {
-          setSyncError("");
-          setSyncTick((tick) => tick + 1);
-        }
-      }
-    })();
-  }, [addAccesses, getSessionToken, isReady, pendingWork, rekeyItem, syncTick]);
+  }, [decryptVersion, isReady, serverItems]);
 
   const items = useMemo<PasswordItem[]>(() => {
     if (!serverItems) {
@@ -555,11 +454,8 @@ export default function PasswordManager({
     setSuccess("");
 
     try {
-      const sessionToken = await getSessionToken();
-
       // Şifreleme Rust'ta yapılır; Convex'e yalnızca şifreli veri gider.
       const encrypted = await invoke<NewItem>("encrypt_new_item", {
-        sessionToken,
         title: title.trim(),
         username: username.trim() || null,
         password,
@@ -589,10 +485,7 @@ export default function PasswordManager({
     setSuccess("");
 
     try {
-      const sessionToken = await getSessionToken();
-
       await invoke("copy_item_password_to_clipboard", {
-        sessionToken,
         item: toEncryptedItem(item.server),
       });
 
@@ -606,22 +499,9 @@ export default function PasswordManager({
     }
   }
 
-  if (!isUnlocked) {
-    return (
-      <section style={styles.page}>
-        Kasayı açtıktan sonra parola yönetimini kullanabilirsin.
-      </section>
-    );
-  }
-
-  if (!isConvexAuthenticated) {
-    return (
-      <section style={styles.page}>
-        {isConvexAuthLoading
-          ? "Sunucu bağlantısı kuruluyor..."
-          : "Sunucu oturumu doğrulanamadı. Clerk'teki Convex entegrasyonunu kontrol et."}
-      </section>
-    );
+  // Çevrimdışı erişim (yerel şifreli önbellek) bir sonraki adımda eklenecek.
+  if (!isReady) {
+    return <section style={styles.page}>Sunucu bağlantısı bekleniyor...</section>;
   }
 
   return (
@@ -681,12 +561,6 @@ export default function PasswordManager({
         </p>
       )}
 
-      {syncError && (
-        <p role="alert" style={styles.error}>
-          {syncError}
-        </p>
-      )}
-
       {success && (
         <p role="status" style={styles.success}>
           {success}
@@ -727,9 +601,9 @@ export default function PasswordManager({
             fontSize: 13,
           }}
         >
-          Seninle paylaşılmış {pendingSharedCount} parola henüz açılmadı. Parolaya
-          erişimi olan biri uygulamayı açtığında otomatik olarak listene
-          eklenecek.
+          Seninle paylaşılmış {pendingSharedCount} parolanın anahtarı hazırlanıyor.
+          Genellikle birkaç saniye sürer; uzarsa paylaşımı yapan kişi ya da bir
+          yönetici uygulamayı açtığında tamamlanır.
         </p>
       )}
 

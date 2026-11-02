@@ -26,10 +26,8 @@
     "vitest": "^5.0.5"
   },
   "dependencies": {
-    "@clerk/localizations": "^4.24.0",
-    "@clerk/react": "^6.17.8",
-    "@clerk/themes": "^2.4.57",
-    "@clerk/ui": "^1.40.0",
+    "@auth/core": "^0.41.1",
+    "@convex-dev/auth": "^0.0.96",
     "@tauri-apps/api": "^2.12.3",
     "convex": "^1.46.0",
     "react": "^19.3.0",

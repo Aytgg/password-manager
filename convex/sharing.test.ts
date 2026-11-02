@@ -1,7 +1,7 @@
 import { convexTest } from "convex-test";
-import { afterEach, describe, expect, test, vi } from "vitest";
+import { describe, expect, test } from "vitest";
 
-import { api, internal } from "./_generated/api";
+import { api } from "./_generated/api";
 import type { Id } from "./_generated/dataModel";
 import schema from "./schema";
 import { modules } from "./test.setup";
@@ -18,29 +18,33 @@ const wrapped = (n: number) => ({
   nonce: b64(12, n),
   ciphertext: b64(48, n),
 });
+const verifier = (n: number) => n.toString(16).padStart(2, "0").repeat(32);
 
 let itemCounter = 0;
 const newItemId = () => `item-${(++itemCounter).toString(16).padStart(32, "0")}`;
+
+type Name = "admin" | "alice" | "bob" | "carol" | "manager";
 
 async function setup() {
   const t = convexTest(schema, modules);
 
   const ids = await t.run(async (ctx) => {
     const now = Date.now();
+    const department = (name: string) =>
+      ctx.db.insert("departments", { name, keyVersion: 0, needsRotation: false, createdAt: now });
 
-    const yazilim = await ctx.db.insert("departments", { name: "Yazılım", createdAt: now });
-    const satis = await ctx.db.insert("departments", { name: "Satış", createdAt: now });
+    const yazilim = await department("Yazılım");
+    const satis = await department("Satış");
 
     const user = (
-      clerkId: string,
+      name: string,
       role: "admin" | "manager" | "member",
       departmentId: Id<"departments"> | undefined,
       key: number,
     ) =>
       ctx.db.insert("users", {
-        email: `${clerkId}@vs.com`,
-        clerkId,
-        displayName: clerkId,
+        email: `${name}@vs.com`,
+        displayName: name,
         publicKey: publicKey(key),
         role,
         departmentId,
@@ -60,9 +64,76 @@ async function setup() {
     };
   });
 
-  const as = (clerkId: string) => t.withIdentity({ subject: clerkId });
+  const userIds: Record<Name, Id<"users">> = {
+    admin: ids.admin,
+    alice: ids.alice,
+    bob: ids.bob,
+    carol: ids.carol,
+    manager: ids.manager,
+  };
+  const uid = (name: Name) => userIds[name];
+  const nameOf = (userId: Id<"users">) =>
+    Object.entries(userIds).find(([, id]) => id === userId)?.[0] ?? userId;
+  const names = (rows: { userId: Id<"users"> }[]) => rows.map((r) => nameOf(r.userId)).sort();
 
-  async function createItem(owner: string) {
+  // Convex Auth kimliği `userId|sessionId` biçimindedir.
+  const asId = (userId: Id<"users">) => t.withIdentity({ subject: `${userId}|session` });
+  const as = (name: Name) => asId(uid(name));
+
+  /** Yöneticinin cihazının yapacağı gibi bekleyen departman anahtarı işlerini tamamlar. */
+  async function runDepartmentWork(actor: Name = "admin") {
+    const work = await as(actor).query(api.keys.pendingWork, {});
+
+    for (const init of work.inits) {
+      await as(actor).mutation(api.keys.initDepartmentKey, {
+        departmentId: init.departmentId,
+        publicKey: publicKey(90),
+        accesses: init.holders.map((h) => ({ userId: h.userId, access: wrapped(30) })),
+      });
+    }
+
+    for (const fill of work.fills) {
+      await as(actor).mutation(api.keys.addDepartmentKeys, {
+        departmentId: fill.departmentId,
+        keyVersion: fill.keyVersion,
+        accesses: fill.recipients.map((r) => ({ userId: r.userId, access: wrapped(31) })),
+      });
+    }
+
+    for (const rotation of work.rotations) {
+      await as(actor).mutation(api.keys.rotateDepartmentKey, {
+        departmentId: rotation.departmentId,
+        keyVersion: rotation.keyVersion,
+        publicKey: publicKey(91),
+        accesses: rotation.holders.map((h) => ({ userId: h.userId, access: wrapped(32) })),
+        itemKeys: rotation.itemKeys.map((k) => ({ item: k.item, access: wrapped(33) })),
+      });
+    }
+
+    return work;
+  }
+
+  /** Kaydın sahibinin cihazının yapacağı gibi eksik paketleri tamamlar. */
+  async function runItemWork(actor: Name) {
+    const work = await as(actor).query(api.items.pendingWork, {});
+
+    for (const fill of work.fills) {
+      await as(actor).mutation(api.items.addAccesses, {
+        id: fill.item.id,
+        keyVersion: fill.item.keyVersion,
+        accesses: fill.recipients.map((r, i) => ({ userId: r.userId, access: wrapped(10 + i) })),
+        departmentAccesses: fill.departments.map((d) => ({
+          departmentId: d.departmentId,
+          keyVersion: d.keyVersion,
+          access: wrapped(20),
+        })),
+      });
+    }
+
+    return work;
+  }
+
+  async function createItem(owner: Name) {
     return await as(owner).mutation(api.items.create, {
       itemId: newItemId(),
       metadata: sealed(1),
@@ -71,409 +142,445 @@ async function setup() {
     });
   }
 
-  async function fill(actor: string, id: Id<"items">, userIds: string[]) {
-    const item = await t.run(async (ctx) => ctx.db.get(id));
-
-    await as(actor).mutation(api.items.addAccesses, {
-      id,
-      keyVersion: item!.keyVersion,
-      accesses: userIds.map((userId, index) => ({ userId, access: wrapped(10 + index) })),
-    });
+  async function shareWithDepartment(owner: Name, id: Id<"items">, departmentId: Id<"departments">) {
+    await as(owner).mutation(api.items.setDepartmentGrant, { id, departmentId, granted: true });
+    await runItemWork(owner);
   }
 
-  async function accessUserIds(id: Id<"items">) {
-    return await t.run(async (ctx) =>
-      (
+  async function shareWithUser(owner: Name, id: Id<"items">, userId: Id<"users">) {
+    await as(owner).mutation(api.items.setUserGrant, { id, userId, granted: true });
+    await runItemWork(owner);
+  }
+
+  const visible = async (userId: Id<"users">) =>
+    (await asId(userId).query(api.items.listMine, {})).map((item) => item.id);
+
+  const directAccessNames = (id: Id<"items">) =>
+    t.run(async (ctx) =>
+      names(
         await ctx.db
           .query("itemAccess")
           .withIndex("by_item", (q) => q.eq("item", id))
-          .collect()
-      )
-        .map((row) => row.userId)
-        .sort(),
+          .collect(),
+      ),
     );
-  }
+
+  const departmentKeyNames = (departmentId: Id<"departments">) =>
+    t.run(async (ctx) =>
+      names(
+        await ctx.db
+          .query("departmentKeys")
+          .withIndex("by_department_and_user", (q) => q.eq("department", departmentId))
+          .collect(),
+      ),
+    );
 
   const getItem = (id: Id<"items">) => t.run(async (ctx) => ctx.db.get(id));
+  const getDepartment = (id: Id<"departments">) => t.run(async (ctx) => ctx.db.get(id));
 
-  return { t, ids, as, createItem, fill, accessUserIds, getItem };
+  async function inviteUser(email: string, departmentId: Id<"departments">, key: number) {
+    await as("admin").mutation(api.members.invite, {
+      email,
+      role: "member",
+      departmentId,
+      publicKey: publicKey(key),
+      verifier: verifier(key),
+      expiresInHours: 24,
+    });
+
+    return (await t.run((ctx) =>
+      ctx.db
+        .query("users")
+        .withIndex("by_email", (q) => q.eq("email", email))
+        .unique(),
+    ))!._id;
+  }
+
+  // Kayıt akışı auth.test.ts'te test edilir; burada sonucu taklit edilir.
+  const activate = (userId: Id<"users">) =>
+    t.run((ctx) => ctx.db.patch(userId, { status: "active", inviteVerifierHash: undefined }));
+
+  return {
+    t,
+    ids,
+    uid,
+    as,
+    asId,
+    runDepartmentWork,
+    runItemWork,
+    createItem,
+    shareWithDepartment,
+    shareWithUser,
+    visible,
+    directAccessNames,
+    departmentKeyNames,
+    getItem,
+    getDepartment,
+    inviteUser,
+    activate,
+  };
 }
 
-afterEach(() => {
-  vi.unstubAllEnvs();
-});
+describe("departman anahtarları", () => {
+  test("yeni departmanın anahtarını yönetici üretir; üyeler ve yöneticiler alır", async () => {
+    const { as, ids, runDepartmentWork, departmentKeyNames, getDepartment } = await setup();
 
-describe("hesap eşleştirme", () => {
-  test("ADMIN_EMAIL ile giren doğrulanmış hesap yönetici olur", async () => {
-    vi.stubEnv("ADMIN_EMAIL", "boss@vs.com");
-    const t = convexTest(schema, modules);
-    const boss = t.withIdentity({ subject: "boss", email: "Boss@VS.com", emailVerified: true });
+    expect((await as("alice").query(api.keys.pendingWork, {})).inits).toHaveLength(0);
 
-    await boss.action(api.users.activate, {});
+    const work = await runDepartmentWork();
+    expect(work.inits).toHaveLength(2);
 
-    expect(await boss.query(api.users.me, {})).toMatchObject({
-      role: "admin",
-      status: "active",
-      email: "boss@vs.com",
-    });
+    expect(await departmentKeyNames(ids.yazilim)).toEqual(["admin", "alice", "bob"]);
+    expect(await departmentKeyNames(ids.satis)).toEqual(["admin", "carol", "manager"]);
+    expect(await getDepartment(ids.yazilim)).toMatchObject({ keyVersion: 1, publicKey: publicKey(90) });
+
+    expect(await runDepartmentWork()).toEqual({ inits: [], fills: [], rotations: [] });
   });
 
-  test("davet edilmemiş hesap reddedilir", async () => {
-    vi.stubEnv("ADMIN_EMAIL", "boss@vs.com");
-    const t = convexTest(schema, modules);
+  test("ilk anahtar bütün sahipleri kapsamalı ve yalnız yönetici üretebilir", async () => {
+    const { as, ids, uid } = await setup();
 
     await expect(
-      t
-        .withIdentity({ subject: "stranger", email: "stranger@vs.com", emailVerified: true })
-        .action(api.users.activate, {}),
-    ).rejects.toThrow(/davet edilmemiş/);
-
-    expect(
-      await t.withIdentity({ subject: "stranger" }).query(api.users.me, {}),
-    ).toBeNull();
-  });
-
-  test("davetli e-posta ilk girişte hesaba bağlanır", async () => {
-    const { t, ids } = await setup();
-
-    await t.run(async (ctx) => {
-      await ctx.db.insert("users", {
-        email: "new@vs.com",
-        role: "member",
+      as("admin").mutation(api.keys.initDepartmentKey, {
         departmentId: ids.yazilim,
-        status: "invited",
-        createdAt: 0,
-        updatedAt: 0,
-      });
-    });
+        publicKey: publicKey(90),
+        accesses: [{ userId: uid("admin"), access: wrapped(1) }],
+      }),
+    ).rejects.toThrow(/sahipleri değişti/);
 
-    const newcomer = t.withIdentity({ subject: "new", email: "new@vs.com", emailVerified: true });
-    await newcomer.action(api.users.activate, {});
-
-    expect(await newcomer.query(api.users.me, {})).toMatchObject({
-      status: "active",
-      departmentName: "Yazılım",
-    });
-  });
-
-  test("devre dışı bırakılmış davet kabul edilmez", async () => {
-    const { t, ids } = await setup();
-
-    await t.run(async (ctx) => {
-      await ctx.db.insert("users", {
-        email: "gone@vs.com",
-        role: "member",
+    await expect(
+      as("alice").mutation(api.keys.initDepartmentKey, {
         departmentId: ids.yazilim,
-        status: "disabled",
-        createdAt: 0,
-        updatedAt: 0,
-      });
+        publicKey: publicKey(90),
+        accesses: [],
+      }),
+    ).rejects.toThrow(/yalnızca yönetici/);
+  });
+
+  test("departmana paylaşılan şifreyi üyeler departman anahtarıyla görür, diğerleri görmez", async () => {
+    const { ids, uid, as, runDepartmentWork, createItem, shareWithDepartment, visible } =
+      await setup();
+    await runDepartmentWork();
+
+    const id = await createItem("alice");
+    await shareWithDepartment("alice", id, ids.yazilim);
+
+    expect(await visible(uid("bob"))).toEqual([id]);
+    expect(await visible(uid("carol"))).toEqual([]);
+    // Yönetici anahtarı tutar ama kural gereği listede görmez.
+    expect(await visible(uid("admin"))).toEqual([]);
+
+    const [item] = await as("bob").query(api.items.listMine, {});
+    expect(item.access).toEqual({
+      kind: "department",
+      departmentKey: wrapped(30),
+      itemKey: wrapped(20),
     });
-
-    await expect(
-      t
-        .withIdentity({ subject: "gone", email: "gone@vs.com", emailVerified: true })
-        .action(api.users.activate, {}),
-    ).rejects.toThrow(/devre dışı/);
   });
 
-  test("token'daki doğrulanmamış e-postaya güvenilmez", async () => {
-    vi.stubEnv("ADMIN_EMAIL", "boss@vs.com");
-    vi.stubEnv("CLERK_SECRET_KEY", "");
-    const t = convexTest(schema, modules);
+  test("departmana sonradan katılan, şifre sahibi çevrimdışıyken de erişir", async () => {
+    const { ids, uid, as, runDepartmentWork, createItem, shareWithDepartment, visible } =
+      await setup();
+    await runDepartmentWork();
 
-    // Doğrulanmamış e-posta kullanılmaz; Clerk API'ye başvurulur, anahtar
-    // olmadığı için işlem reddedilir ve yönetici hesabı oluşmaz.
-    await expect(
-      t
-        .withIdentity({ subject: "fake", email: "boss@vs.com", emailVerified: false })
-        .action(api.users.activate, {}),
-    ).rejects.toThrow(/CLERK_SECRET_KEY/);
+    const id = await createItem("alice");
+    await shareWithDepartment("alice", id, ids.yazilim);
 
-    expect(await t.withIdentity({ subject: "fake" }).query(api.users.me, {})).toBeNull();
+    await as("admin").mutation(api.members.update, { id: uid("carol"), departmentId: ids.yazilim });
+    expect(await visible(uid("carol"))).toEqual([]);
+    expect(await as("carol").query(api.items.pendingSharedCount, {})).toBe(1);
+
+    // Alice hiçbir şey yapmaz; değişikliği yapan yöneticinin cihazı yeter.
+    const work = await runDepartmentWork();
+    expect(work.fills.map((f) => f.recipients.map((r) => r.userId))).toEqual([[uid("carol")]]);
+
+    expect(await visible(uid("carol"))).toEqual([id]);
+    expect(await as("carol").query(api.items.pendingSharedCount, {})).toBe(0);
   });
-});
 
-describe("paylaşım ve rekey", () => {
-  test("departman paylaşımı üyeye bekleyen anahtar bırakır, tamamlanınca görünür", async () => {
-    const { as, ids, createItem, fill } = await setup();
+  test("davet edilen kullanıcı gece kaydolduğunda departman şifrelerini hemen görür", async () => {
+    const { ids, runDepartmentWork, createItem, shareWithDepartment, visible, inviteUser, activate } =
+      await setup();
+    await runDepartmentWork();
+
+    const id = await createItem("alice");
+    await shareWithDepartment("alice", id, ids.yazilim);
+
+    const dave = await inviteUser("dave@vs.com", ids.yazilim, 40);
+    // Davet anında yöneticinin cihazı departman anahtarını geçici anahtara paketler.
+    await runDepartmentWork();
+
+    await activate(dave);
+    expect(await visible(dave)).toEqual([id]);
+  });
+
+  test("henüz kaydolmamış kişiye tek bir şifre doğrudan paylaşılabilir", async () => {
+    const { ids, as, createItem, shareWithUser, visible, inviteUser, activate, directAccessNames } =
+      await setup();
+
+    const vendor = await inviteUser("vendor@dis.com", ids.satis, 41);
     const id = await createItem("alice");
 
-    await as("alice").mutation(api.items.setDepartmentGrant, {
-      id,
-      departmentId: ids.yazilim,
-      granted: true,
-    });
+    const sharing = await as("alice").query(api.items.sharing, { id });
+    expect(sharing.users.find((u) => u.userId === vendor)).toMatchObject({ status: "invited" });
 
-    expect(await as("bob").query(api.items.listMine, {})).toHaveLength(0);
-    expect(await as("bob").query(api.items.pendingSharedCount, {})).toBe(1);
+    await shareWithUser("alice", id, vendor);
+    expect(await directAccessNames(id)).toHaveLength(2);
 
-    // Erişimi olmayan bob anahtar üretemez; işi erişimi olan alice görür.
-    expect((await as("bob").query(api.items.pendingWork, {})).fills).toHaveLength(0);
-
-    const work = await as("alice").query(api.items.pendingWork, {});
-    expect(work.fills).toHaveLength(1);
-    expect(work.fills[0].recipients.map((r) => r.userId)).toEqual(["bob"]);
-    expect(work.fills[0].recipients[0].publicKey).toBe(publicKey(3));
-
-    await fill("alice", id, ["bob"]);
-
-    expect(await as("bob").query(api.items.listMine, {})).toHaveLength(1);
-    expect(await as("bob").query(api.items.pendingSharedCount, {})).toBe(0);
-    expect((await as("alice").query(api.items.pendingWork, {})).fills).toHaveLength(0);
+    // Gece kaydolur; kimsenin çevrimiçi olması gerekmez.
+    await activate(vendor);
+    expect(await visible(vendor)).toEqual([id]);
   });
 
-  test("departman paylaşımı kaldırılınca erişim silinir ve rekey zorunlu olur", async () => {
-    const { as, ids, createItem, fill, accessUserIds, getItem } = await setup();
+  test("departmandan çıkan üye için anahtar yenilenir ve şifreler yeniden şifrelenir", async () => {
+    const {
+      ids, uid, as, runDepartmentWork, createItem, shareWithDepartment, visible,
+      departmentKeyNames, getDepartment, getItem,
+    } = await setup();
+    await runDepartmentWork();
+
     const id = await createItem("alice");
+    await shareWithDepartment("alice", id, ids.yazilim);
 
-    await as("alice").mutation(api.items.setDepartmentGrant, {
-      id,
-      departmentId: ids.yazilim,
-      granted: true,
-    });
-    await fill("alice", id, ["bob"]);
+    await as("admin").mutation(api.members.update, { id: uid("bob"), departmentId: ids.satis });
 
-    await as("alice").mutation(api.items.setDepartmentGrant, {
-      id,
-      departmentId: ids.yazilim,
-      granted: false,
-    });
-
-    expect(await as("bob").query(api.items.listMine, {})).toHaveLength(0);
-    expect(await accessUserIds(id)).toEqual(["alice"]);
+    expect(await visible(uid("bob"))).toEqual([]);
+    expect(await departmentKeyNames(ids.yazilim)).toEqual(["admin", "alice"]);
+    expect(await getDepartment(ids.yazilim)).toMatchObject({ needsRotation: true });
     expect((await getItem(id))!.needsRekey).toBe(true);
 
-    const work = await as("alice").query(api.items.pendingWork, {});
-    expect(work.rekeys).toHaveLength(1);
-    expect(work.rekeys[0].recipients).toEqual([]);
+    const work = await runDepartmentWork();
+    expect(work.rotations).toHaveLength(1);
+    expect(work.rotations[0].itemKeys.map((k) => k.item)).toEqual([id]);
+
+    expect(await getDepartment(ids.yazilim)).toMatchObject({
+      keyVersion: 2,
+      needsRotation: false,
+      publicKey: publicKey(91),
+    });
+    expect(await departmentKeyNames(ids.yazilim)).toEqual(["admin", "alice"]);
+    // Bob satış departmanının anahtarını da alır.
+    expect(await departmentKeyNames(ids.satis)).toEqual(["admin", "bob", "carol", "manager"]);
+    expect(await visible(uid("alice"))).toEqual([id]);
   });
 
-  test("rekey kuralları: yalnız sahip, güncel sürüm, yalnız yetkililer, sahip dahil", async () => {
-    const { as, createItem, fill, accessUserIds, getItem } = await setup();
+  test("anahtar yenilemesi eksik sahip ya da eksik kayıtla kabul edilmez", async () => {
+    const { ids, uid, as, runDepartmentWork, createItem, shareWithDepartment } = await setup();
+    await runDepartmentWork();
+
+    const id = await createItem("alice");
+    await shareWithDepartment("alice", id, ids.yazilim);
+    await as("admin").mutation(api.members.update, { id: uid("bob"), departmentId: ids.satis });
+
+    const base = {
+      departmentId: ids.yazilim,
+      keyVersion: 1,
+      publicKey: publicKey(91),
+      accesses: [
+        { userId: uid("admin"), access: wrapped(1) },
+        { userId: uid("alice"), access: wrapped(1) },
+      ],
+      itemKeys: [{ item: id, access: wrapped(1) }],
+    };
+
+    await expect(
+      as("admin").mutation(api.keys.rotateDepartmentKey, { ...base, accesses: base.accesses.slice(1) }),
+    ).rejects.toThrow(/sahipleri değişti/);
+
+    await expect(
+      as("admin").mutation(api.keys.rotateDepartmentKey, { ...base, itemKeys: [] }),
+    ).rejects.toThrow(/kayıtları değişti/);
+
+    await expect(as("bob").mutation(api.keys.rotateDepartmentKey, base)).rejects.toThrow(
+      /anahtarına sahip değilsin/,
+    );
+
+    await as("admin").mutation(api.keys.rotateDepartmentKey, base);
+  });
+
+  test("devre dışı bırakılan yöneticinin bütün departman anahtarları yenilenir", async () => {
+    const { t, ids, as, runDepartmentWork, getDepartment } = await setup();
+    await runDepartmentWork();
+
+    const second = await t.run((ctx) =>
+      ctx.db.insert("users", {
+        email: "admin2@vs.com",
+        publicKey: publicKey(6),
+        role: "admin",
+        status: "active",
+        createdAt: 0,
+        updatedAt: 0,
+      }),
+    );
+    await runDepartmentWork();
+
+    await as("admin").mutation(api.members.update, { id: second, enabled: false });
+
+    expect((await getDepartment(ids.yazilim))!.needsRotation).toBe(true);
+    expect((await getDepartment(ids.satis))!.needsRotation).toBe(true);
+  });
+});
+
+describe("kişiye paylaşım ve rekey", () => {
+  test("kişi paylaşımı kaldırılınca erişim silinir ve rekey zorunlu olur", async () => {
+    const { uid, as, createItem, shareWithUser, visible, directAccessNames, getItem } = await setup();
     const id = await createItem("alice");
 
-    await as("alice").mutation(api.items.setUserGrant, { id, userId: "bob", granted: true });
-    await fill("alice", id, ["bob"]);
-    await as("alice").mutation(api.items.setUserGrant, { id, userId: "bob", granted: false });
+    await shareWithUser("alice", id, uid("carol"));
+    expect(await visible(uid("carol"))).toEqual([id]);
+
+    await as("alice").mutation(api.items.setUserGrant, { id, userId: uid("carol"), granted: false });
+
+    expect(await visible(uid("carol"))).toEqual([]);
+    expect(await directAccessNames(id)).toEqual(["alice"]);
+    expect((await getItem(id))!.needsRekey).toBe(true);
+  });
+
+  test("rekey kuralları: yalnız sahip, güncel sürüm, yalnız yetkililer, departmanlar dahil", async () => {
+    const { ids, uid, as, runDepartmentWork, createItem, shareWithUser, shareWithDepartment, getItem } =
+      await setup();
+    await runDepartmentWork();
+
+    const id = await createItem("alice");
+    await shareWithDepartment("alice", id, ids.yazilim);
+    await shareWithUser("alice", id, uid("carol"));
+    await as("alice").mutation(api.items.setUserGrant, { id, userId: uid("carol"), granted: false });
+
+    const task = (await as("alice").query(api.items.pendingWork, {})).rekeys[0];
+    expect(task.recipients).toEqual([]);
+    expect(task.departments).toEqual([
+      { departmentId: ids.yazilim, keyVersion: 1, publicKey: publicKey(90) },
+    ]);
 
     const valid = {
       id,
       keyVersion: 1,
       metadata: sealed(7),
       secret: sealed(8),
-      accesses: [{ userId: "alice", access: wrapped(20) }],
+      accesses: [{ userId: uid("alice"), access: wrapped(20) }],
+      departmentAccesses: [{ departmentId: ids.yazilim, keyVersion: 1, access: wrapped(21) }],
     };
 
     await expect(as("bob").mutation(api.items.rekey, valid)).rejects.toThrow(/sahibi değilsin/);
-    await expect(as("carol").mutation(api.items.rekey, valid)).rejects.toThrow(/sahibi değilsin/);
-
     await expect(
       as("alice").mutation(api.items.rekey, { ...valid, keyVersion: 0 }),
     ).rejects.toThrow(/başka bir işlemle güncellendi/);
-
     await expect(
       as("alice").mutation(api.items.rekey, {
         ...valid,
-        accesses: [...valid.accesses, { userId: "bob", access: wrapped(21) }],
+        accesses: [...valid.accesses, { userId: uid("carol"), access: wrapped(22) }],
       }),
     ).rejects.toThrow(/erişim vermiyor/);
-
     await expect(
       as("alice").mutation(api.items.rekey, { ...valid, accesses: [] }),
     ).rejects.toThrow(/sahibinin erişimi kaldırılamaz/);
-
+    await expect(
+      as("alice").mutation(api.items.rekey, { ...valid, departmentAccesses: [] }),
+    ).rejects.toThrow(/departmanın anahtarı eksik/);
     await expect(
       as("alice").mutation(api.items.rekey, {
         ...valid,
-        accesses: [valid.accesses[0], valid.accesses[0]],
+        departmentAccesses: [{ departmentId: ids.satis, keyVersion: 1, access: wrapped(23) }],
       }),
-    ).rejects.toThrow(/tekrar eden/);
+    ).rejects.toThrow(/bu departmana erişim vermiyor/);
 
     await as("alice").mutation(api.items.rekey, valid);
 
-    const item = await getItem(id);
-    expect(item).toMatchObject({ keyVersion: 2, needsRekey: false, metadata: sealed(7) });
-    expect(await accessUserIds(id)).toEqual(["alice"]);
+    expect(await getItem(id)).toMatchObject({ keyVersion: 2, needsRekey: false, metadata: sealed(7) });
     expect((await as("alice").query(api.items.pendingWork, {})).rekeys).toHaveLength(0);
   });
 
-  test("bir kişi kaldırılınca rekey kalan kişileri korur", async () => {
-    const { as, createItem, fill, accessUserIds } = await setup();
+  test("rekey beklerken eski anahtar dağıtılmaz", async () => {
+    const { uid, as, createItem, shareWithUser } = await setup();
     const id = await createItem("alice");
 
-    for (const userId of ["bob", "carol"]) {
-      await as("alice").mutation(api.items.setUserGrant, { id, userId, granted: true });
-    }
-    await fill("alice", id, ["bob", "carol"]);
-
-    await as("alice").mutation(api.items.setUserGrant, { id, userId: "bob", granted: false });
-
-    const task = (await as("alice").query(api.items.pendingWork, {})).rekeys[0];
-    expect(task.recipients).toEqual([{ userId: "carol", publicKey: publicKey(4) }]);
-
-    await as("alice").mutation(api.items.rekey, {
-      id,
-      keyVersion: task.item.keyVersion,
-      metadata: sealed(7),
-      secret: sealed(8),
-      accesses: [
-        { userId: "alice", access: wrapped(20) },
-        { userId: "carol", access: wrapped(21) },
-      ],
-    });
-
-    expect(await accessUserIds(id)).toEqual(["alice", "carol"]);
-    expect(await as("carol").query(api.items.listMine, {})).toHaveLength(1);
-    expect(await as("bob").query(api.items.listMine, {})).toHaveLength(0);
-  });
-
-  test("rekey beklerken eski anahtar dağıtılmaz, rekey sonrası eksikler tamamlanır", async () => {
-    const { as, createItem, fill } = await setup();
-    const id = await createItem("alice");
-
-    await as("alice").mutation(api.items.setUserGrant, { id, userId: "bob", granted: true });
-    await fill("alice", id, ["bob"]);
-    await as("alice").mutation(api.items.setUserGrant, { id, userId: "carol", granted: true });
-    await as("alice").mutation(api.items.setUserGrant, { id, userId: "bob", granted: false });
-
-    let work = await as("alice").query(api.items.pendingWork, {});
-    expect(work.fills).toHaveLength(0);
-    expect(work.rekeys).toHaveLength(1);
-
-    await as("alice").mutation(api.items.rekey, {
-      id,
-      keyVersion: 1,
-      metadata: sealed(7),
-      secret: sealed(8),
-      accesses: [{ userId: "alice", access: wrapped(20) }],
-    });
-
-    work = await as("alice").query(api.items.pendingWork, {});
-    expect(work.fills).toHaveLength(1);
-    expect(work.fills[0].item.keyVersion).toBe(2);
-    expect(work.fills[0].recipients.map((r) => r.userId)).toEqual(["carol"]);
-  });
-
-  test("departman değişikliği eski departman paylaşımlarına erişimi kaldırır", async () => {
-    const { as, ids, createItem, fill, accessUserIds, getItem } = await setup();
-    const id = await createItem("alice");
-
-    await as("alice").mutation(api.items.setDepartmentGrant, {
-      id,
-      departmentId: ids.yazilim,
-      granted: true,
-    });
-    await fill("alice", id, ["bob"]);
-
-    await as("admin").mutation(api.members.update, { id: ids.bob, departmentId: ids.satis });
-
-    expect(await accessUserIds(id)).toEqual(["alice"]);
-    expect((await getItem(id))!.needsRekey).toBe(true);
-    expect(await as("bob").query(api.items.pendingSharedCount, {})).toBe(0);
-  });
-
-  test("departmana katılan kişi departman paylaşımlarını bekler", async () => {
-    const { as, ids, createItem } = await setup();
-    const id = await createItem("alice");
-
-    await as("alice").mutation(api.items.setDepartmentGrant, {
-      id,
-      departmentId: ids.yazilim,
-      granted: true,
-    });
-
-    await as("admin").mutation(api.members.update, { id: ids.carol, departmentId: ids.yazilim });
-
-    expect(await as("carol").query(api.items.pendingSharedCount, {})).toBe(1);
+    await shareWithUser("alice", id, uid("bob"));
+    await as("alice").mutation(api.items.setUserGrant, { id, userId: uid("carol"), granted: true });
+    await as("alice").mutation(api.items.setUserGrant, { id, userId: uid("bob"), granted: false });
 
     const work = await as("alice").query(api.items.pendingWork, {});
-    expect(work.fills[0].recipients.map((r) => r.userId).sort()).toEqual(["bob", "carol"]);
+    expect(work.fills).toHaveLength(0);
+    expect(work.rekeys).toHaveLength(1);
+  });
+
+  test("addAccesses: erişimi olmayan anahtar ekleyemez, kurala uymayana anahtar verilemez", async () => {
+    const { ids, uid, as, createItem } = await setup();
+    const id = await createItem("alice");
+
+    await as("alice").mutation(api.items.setUserGrant, { id, userId: uid("bob"), granted: true });
+
+    const entry = (userId: Id<"users">) => ({
+      id,
+      keyVersion: 1,
+      accesses: [{ userId, access: wrapped(9) }],
+      departmentAccesses: [],
+    });
+
+    await expect(as("carol").mutation(api.items.addAccesses, entry(uid("bob")))).rejects.toThrow(
+      /erişimin yok/,
+    );
+    await expect(as("alice").mutation(api.items.addAccesses, entry(uid("carol")))).rejects.toThrow(
+      /erişim vermiyor/,
+    );
+    await expect(
+      as("alice").mutation(api.items.addAccesses, { ...entry(uid("bob")), keyVersion: 99 }),
+    ).rejects.toThrow(/başka bir işlemle güncellendi/);
+    await expect(
+      as("alice").mutation(api.items.addAccesses, {
+        id,
+        keyVersion: 1,
+        accesses: [],
+        departmentAccesses: [{ departmentId: ids.yazilim, keyVersion: 0, access: wrapped(9) }],
+      }),
+    ).rejects.toThrow(/bu departmana erişim vermiyor/);
   });
 
   test("devre dışı bırakılan kullanıcının erişimi silinir ve API'ye erişemez", async () => {
-    const { as, ids, createItem, fill, accessUserIds, getItem } = await setup();
+    const { ids, uid, as, runDepartmentWork, createItem, shareWithUser, directAccessNames, departmentKeyNames } =
+      await setup();
+    await runDepartmentWork();
+
     const id = await createItem("alice");
+    await shareWithUser("alice", id, uid("carol"));
 
-    await as("alice").mutation(api.items.setUserGrant, { id, userId: "bob", granted: true });
-    await fill("alice", id, ["bob"]);
+    await as("admin").mutation(api.members.update, { id: uid("carol"), enabled: false });
 
-    await as("admin").mutation(api.members.update, { id: ids.bob, enabled: false });
-
-    expect(await accessUserIds(id)).toEqual(["alice"]);
-    expect((await getItem(id))!.needsRekey).toBe(true);
-    await expect(as("bob").query(api.items.listMine, {})).rejects.toThrow(/erişim yetkisi yok/);
-
-    // Rekey anahtar listesinde devre dışı kullanıcı bulunamaz.
-    const work = await as("alice").query(api.items.pendingWork, {});
-    expect(work.rekeys[0].recipients).toEqual([]);
+    expect(await directAccessNames(id)).toEqual(["alice"]);
+    expect(await departmentKeyNames(ids.satis)).toEqual(["admin", "manager"]);
+    await expect(as("carol").query(api.items.listMine, {})).rejects.toThrow(/erişim yetkisi yok/);
   });
 
-  test("addAccesses: erişimi olmayan anahtar ekleyemez, kurala uymayan kişiye anahtar verilemez", async () => {
-    const { as, createItem, fill } = await setup();
+  test("açık anahtarı değişen kullanıcının eski paketleri silinir ve yeniden doldurulur", async () => {
+    const {
+      ids, uid, as, runDepartmentWork, runItemWork, createItem, shareWithUser,
+      directAccessNames, departmentKeyNames,
+    } = await setup();
+    await runDepartmentWork();
+
     const id = await createItem("alice");
+    await shareWithUser("alice", id, uid("carol"));
 
-    await as("alice").mutation(api.items.setUserGrant, { id, userId: "bob", granted: true });
+    await as("carol").mutation(api.users.setPublicKey, { publicKey: publicKey(9) });
 
-    await expect(
-      as("carol").mutation(api.items.addAccesses, {
-        id,
-        keyVersion: 1,
-        accesses: [{ userId: "bob", access: wrapped(9) }],
-      }),
-    ).rejects.toThrow(/erişimin yok/);
+    expect(await directAccessNames(id)).toEqual(["alice"]);
+    expect(await departmentKeyNames(ids.satis)).toEqual(["admin", "manager"]);
 
-    await expect(
-      as("alice").mutation(api.items.addAccesses, {
-        id,
-        keyVersion: 1,
-        accesses: [{ userId: "carol", access: wrapped(9) }],
-      }),
-    ).rejects.toThrow(/erişim vermiyor/);
+    await runItemWork("alice");
+    await runDepartmentWork();
 
-    await expect(
-      as("alice").mutation(api.items.addAccesses, {
-        id,
-        keyVersion: 99,
-        accesses: [{ userId: "bob", access: wrapped(9) }],
-      }),
-    ).rejects.toThrow(/başka bir işlemle güncellendi/);
-
-    // Erişimi olan alıcı da kurala uyan başka biri için anahtar üretebilir.
-    await fill("alice", id, ["bob"]);
-    await as("alice").mutation(api.items.setUserGrant, { id, userId: "carol", granted: true });
-    await fill("bob", id, ["carol"]);
-
-    expect(await as("carol").query(api.items.listMine, {})).toHaveLength(1);
-  });
-
-  test("açık anahtarı değişen kullanıcının eski erişimi silinir ve yeni anahtarla tamamlanır", async () => {
-    const { as, createItem, fill, accessUserIds, getItem } = await setup();
-    const id = await createItem("alice");
-
-    await as("alice").mutation(api.items.setUserGrant, { id, userId: "bob", granted: true });
-    await fill("alice", id, ["bob"]);
-
-    await as("bob").mutation(api.users.setPublicKey, { publicKey: publicKey(9) });
-
-    expect(await accessUserIds(id)).toEqual(["alice"]);
-    // Kural değişmediği için rekey gerekmez; yalnızca yeni anahtara paket gerekir.
-    expect((await getItem(id))!.needsRekey).toBe(false);
-
-    const work = await as("alice").query(api.items.pendingWork, {});
-    expect(work.fills[0].recipients).toEqual([{ userId: "bob", publicKey: publicKey(9) }]);
+    expect(await directAccessNames(id)).toEqual(["alice", "carol"]);
+    expect(await departmentKeyNames(ids.satis)).toEqual(["admin", "carol", "manager"]);
   });
 
   test("paylaşımı yalnızca sahip görür ve yönetir", async () => {
-    const { as, ids, createItem, fill } = await setup();
+    const { ids, uid, as, createItem, shareWithUser } = await setup();
     const id = await createItem("alice");
 
-    await as("alice").mutation(api.items.setUserGrant, { id, userId: "bob", granted: true });
-    await fill("alice", id, ["bob"]);
+    await shareWithUser("alice", id, uid("bob"));
 
     await expect(as("bob").query(api.items.sharing, { id })).rejects.toThrow(/sahibi değilsin/);
     await expect(
-      as("bob").mutation(api.items.setUserGrant, { id, userId: "carol", granted: true }),
+      as("bob").mutation(api.items.setUserGrant, { id, userId: uid("carol"), granted: true }),
     ).rejects.toThrow(/sahibi değilsin/);
     await expect(
       as("admin").mutation(api.items.setDepartmentGrant, {
@@ -485,9 +592,105 @@ describe("paylaşım ve rekey", () => {
   });
 });
 
+describe("davetten kalıcı anahtara geçiş", () => {
+  test("kullanıcı geçici anahtarına paketlenen her şeyi kalıcı anahtarına taşır", async () => {
+    const { t, ids, asId, runDepartmentWork, createItem, shareWithUser, inviteUser, activate } =
+      await setup();
+    await runDepartmentWork();
+
+    const vendor = await inviteUser("vendor@dis.com", ids.satis, 41);
+    await runDepartmentWork();
+    const id = await createItem("alice");
+    await shareWithUser("alice", id, vendor);
+    await activate(vendor);
+
+    const keys = await asId(vendor).query(api.users.myWrappedKeys, {});
+    expect(keys.publicKey).toBe(publicKey(41));
+    expect(keys.itemAccesses).toHaveLength(1);
+    expect(keys.departmentKeys).toHaveLength(1);
+
+    const rotation = {
+      fromPublicKey: publicKey(41),
+      publicKey: publicKey(42),
+      itemAccesses: keys.itemAccesses.map((k) => ({ id: k.id, access: wrapped(50) })),
+      departmentKeys: keys.departmentKeys.map((k) => ({ id: k.id, access: wrapped(51) })),
+    };
+
+    await expect(
+      asId(vendor).mutation(api.users.rotateKey, { ...rotation, fromPublicKey: publicKey(9) }),
+    ).rejects.toThrow(/açık anahtarı değişmiş/);
+    await expect(
+      asId(vendor).mutation(api.users.rotateKey, { ...rotation, itemAccesses: [] }),
+    ).rejects.toThrow(/Anahtarların değişti/);
+
+    await asId(vendor).mutation(api.users.rotateKey, rotation);
+
+    const after = await t.run(async (ctx) => ({
+      user: await ctx.db.get(vendor),
+      access: await ctx.db.get(keys.itemAccesses[0].id),
+    }));
+    expect(after.user!.publicKey).toBe(publicKey(42));
+    expect(after.access!.access).toEqual(wrapped(50));
+  });
+
+  test("davet yenilenince eski geçici anahtara ait paketler silinir ve yeniden doldurulur", async () => {
+    const { t, ids, as, runDepartmentWork, runItemWork, createItem, shareWithUser, inviteUser } =
+      await setup();
+    await runDepartmentWork();
+
+    const vendor = await inviteUser("vendor@dis.com", ids.satis, 41);
+    await runDepartmentWork();
+    const id = await createItem("alice");
+    await shareWithUser("alice", id, vendor);
+
+    await as("admin").mutation(api.members.renewInvite, {
+      id: vendor,
+      publicKey: publicKey(43),
+      verifier: verifier(43),
+      expiresInHours: 72,
+    });
+
+    const count = () =>
+      t.run(async (ctx) => ({
+        items: (
+          await ctx.db
+            .query("itemAccess")
+            .withIndex("by_user", (q) => q.eq("userId", vendor))
+            .collect()
+        ).length,
+        departments: (
+          await ctx.db
+            .query("departmentKeys")
+            .withIndex("by_user", (q) => q.eq("userId", vendor))
+            .collect()
+        ).length,
+      }));
+
+    expect(await count()).toEqual({ items: 0, departments: 0 });
+
+    await runDepartmentWork();
+    await runItemWork("alice");
+
+    expect(await count()).toEqual({ items: 1, departments: 1 });
+  });
+});
+
 describe("kullanıcı yönetimi", () => {
+  const invite = (
+    email: string,
+    role: "admin" | "manager" | "member",
+    departmentId?: Id<"departments">,
+  ) => ({
+    email,
+    role,
+    departmentId,
+    publicKey: publicKey(60),
+    verifier: verifier(60),
+    expiresInHours: 168,
+  });
+
   test("departman yöneticisi yalnızca kendi departmanındaki personeli devre dışı bırakabilir", async () => {
-    const { t, as, ids } = await setup();
+    const { t, ids, as } = await setup();
 
     await as("manager").mutation(api.members.update, { id: ids.carol, enabled: false });
     expect((await t.run((ctx) => ctx.db.get(ids.carol)))!.status).toBe("disabled");
@@ -498,7 +701,7 @@ describe("kullanıcı yönetimi", () => {
   });
 
   test("departman yöneticisi rol ve departman değiştiremez", async () => {
-    const { as, ids } = await setup();
+    const { ids, as } = await setup();
 
     await expect(
       as("manager").mutation(api.members.update, { id: ids.carol, role: "manager" }),
@@ -510,28 +713,17 @@ describe("kullanıcı yönetimi", () => {
   });
 
   test("departman yöneticisi yalnızca kendi departmanına personel davet edebilir", async () => {
-    const { t, as, ids } = await setup();
+    const { t, ids, as } = await setup();
 
     await expect(
-      as("manager").mutation(internal.members.createInvited, {
-        email: "x@vs.com",
-        role: "admin",
-      }),
+      as("manager").mutation(api.members.invite, invite("x@vs.com", "admin")),
     ).rejects.toThrow(/yalnızca kendi departmanına personel/);
 
     await expect(
-      as("manager").mutation(internal.members.createInvited, {
-        email: "x@vs.com",
-        role: "member",
-        departmentId: ids.yazilim,
-      }),
+      as("manager").mutation(api.members.invite, invite("x@vs.com", "member", ids.yazilim)),
     ).rejects.toThrow(/yalnızca kendi departmanına personel/);
 
-    await as("manager").mutation(internal.members.createInvited, {
-      email: "X@VS.com",
-      role: "member",
-      departmentId: ids.satis,
-    });
+    await as("manager").mutation(api.members.invite, invite("X@VS.com", "member", ids.satis));
 
     const invited = await t.run((ctx) =>
       ctx.db
@@ -539,24 +731,32 @@ describe("kullanıcı yönetimi", () => {
         .withIndex("by_email", (q) => q.eq("email", "x@vs.com"))
         .unique(),
     );
-    expect(invited).toMatchObject({ status: "invited", role: "member" });
+    expect(invited).toMatchObject({ status: "invited", role: "member", publicKey: publicKey(60) });
+    expect(invited!.inviteVerifierHash).toMatch(/^[0-9a-f]{64}$/);
+  });
+
+  test("davet süresi yalnızca izin verilen seçeneklerden olabilir", async () => {
+    const { ids, as } = await setup();
+
+    await expect(
+      as("admin").mutation(api.members.invite, {
+        ...invite("y@vs.com", "member", ids.satis),
+        expiresInHours: 1000,
+      }),
+    ).rejects.toThrow(/Geçersiz davet süresi/);
   });
 
   test("personel kullanıcı listesini göremez ve davet edemez", async () => {
-    const { as, ids } = await setup();
+    const { ids, as } = await setup();
 
     await expect(as("bob").query(api.members.list, {})).rejects.toThrow(/görme yetkin yok/);
     await expect(
-      as("bob").mutation(internal.members.createInvited, {
-        email: "y@vs.com",
-        role: "member",
-        departmentId: ids.yazilim,
-      }),
+      as("bob").mutation(api.members.invite, invite("y@vs.com", "member", ids.yazilim)),
     ).rejects.toThrow(/davet etme yetkin yok/);
   });
 
   test("yönetici kendi hesabını değiştiremez, departmanları yalnız yönetici oluşturur", async () => {
-    const { as, ids } = await setup();
+    const { ids, as } = await setup();
 
     await expect(
       as("admin").mutation(api.members.update, { id: ids.admin, enabled: false }),

@@ -3,15 +3,22 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{crypto::identity::IdentityKeyPair, storage::key_store::PlatformKeyStore};
+use crate::{
+    crypto::{identity::IdentityKeyPair, key_encryption::ProtectedMasterKey},
+    storage::key_store::PlatformKeyStore,
+    vault::owner_binding::VaultOwner,
+};
 
 pub const AUTO_LOCK_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 struct UnlockedVault {
     identity: IdentityKeyPair,
     key_store: PlatformKeyStore,
-    clerk_user_id: String,
+    owner: VaultOwner,
     last_activity: Instant,
+    /// Sunucu parolayı onaylayana kadar diske yazılmayan yeni ana anahtar
+    /// koruması (parola değişikliği).
+    pending_master_key: Option<ProtectedMasterKey>,
 }
 
 pub struct VaultSession {
@@ -71,141 +78,108 @@ impl VaultSession {
         Ok(true)
     }
 
-    fn remove_if_wrong_user(
-        vault: &mut Option<UnlockedVault>,
-        requested_user_id: &str,
-    ) -> Result<bool, String> {
-        let wrong_user = vault
-            .as_ref()
-            .is_some_and(|unlocked| unlocked.clerk_user_id != requested_user_id);
-
-        if !wrong_user {
-            return Ok(false);
-        }
-
-        Self::release(vault)?;
-        Ok(true)
+    fn guard(&self) -> Result<std::sync::MutexGuard<'_, Option<UnlockedVault>>, String> {
+        self.vault
+            .lock()
+            .map_err(|_| "Vault session lock poisoned".to_string())
     }
 
     pub fn is_unlocked(&self) -> Result<bool, String> {
-        self.lock_if_idle()?;
-
-        let guard = self
-            .vault
-            .lock()
-            .map_err(|_| "Vault session lock poisoned".to_string())?;
-
-        Ok(guard.is_some())
+        Ok(self.current_owner()?.is_some())
     }
 
-    pub fn is_unlocked_for_user(&self, user_id: &str) -> Result<bool, String> {
-        let user_id = user_id.trim();
+    /// Açık kasanın sahibi; kasa kilitliyse `None`.
+    pub fn current_owner(&self) -> Result<Option<VaultOwner>, String> {
+        let mut guard = self.guard()?;
 
-        if user_id.is_empty() {
-            return Err("Clerk kullanıcı kimliği boş olamaz.".to_string());
-        }
+        Self::expire_if_needed(&mut guard, self.idle_timeout)?;
 
-        self.lock_if_idle()?;
-
-        let mut guard = self
-            .vault
-            .lock()
-            .map_err(|_| "Vault session lock poisoned".to_string())?;
-
-        if Self::remove_if_wrong_user(&mut guard, user_id)? {
-            return Ok(false);
-        }
-
-        Ok(guard.is_some())
+        Ok(guard.as_ref().map(|unlocked| unlocked.owner.clone()))
     }
 
     pub fn unlock(
         &self,
         identity: IdentityKeyPair,
         key_store: PlatformKeyStore,
-        clerk_user_id: String,
+        owner: VaultOwner,
     ) -> Result<(), String> {
-        let clerk_user_id = clerk_user_id.trim().to_string();
+        let mut guard = self.guard()?;
 
-        if clerk_user_id.is_empty() {
-            return Err("Clerk kullanıcı kimliği boş olamaz.".to_string());
-        }
-
-        let mut guard = self
-            .vault
-            .lock()
-            .map_err(|_| "Vault session lock poisoned".to_string())?;
-
-        if guard.is_some() {
-            return Err("Vault is already unlocked".to_string());
-        }
+        // Başka bir hesabın kasası açık kalmışsa önce kapatılır.
+        Self::release(&mut guard)?;
 
         *guard = Some(UnlockedVault {
             identity,
             key_store,
-            clerk_user_id,
+            owner,
             last_activity: Instant::now(),
+            pending_master_key: None,
         });
 
         Ok(())
     }
 
     pub fn lock(&self) -> Result<(), String> {
-        let mut guard = self
-            .vault
-            .lock()
-            .map_err(|_| "Vault session lock poisoned".to_string())?;
+        let mut guard = self.guard()?;
 
         Self::release(&mut guard)
     }
 
     pub fn lock_if_idle(&self) -> Result<bool, String> {
-        let mut guard = self
-            .vault
-            .lock()
-            .map_err(|_| "Vault session lock poisoned".to_string())?;
+        let mut guard = self.guard()?;
 
         Self::expire_if_needed(&mut guard, self.idle_timeout)
     }
 
-    pub fn record_activity_for_user(&self, user_id: &str) -> Result<(), String> {
-        self.with_identity_for_user(user_id, |_| Ok(()))
+    pub fn record_activity(&self) -> Result<(), String> {
+        self.with_identity(|_, _| Ok(()))
     }
 
-    /// Kasa bu kullanıcı için açıksa kimlik anahtarıyla işlem yapar ve
-    /// etkinlik zamanını günceller.
-    pub fn with_identity_for_user<T>(
+    /// Kasa açıksa kimlik anahtarıyla işlem yapar ve etkinlik zamanını
+    /// günceller.
+    pub fn with_identity<T>(
         &self,
-        user_id: &str,
-        operation: impl FnOnce(&IdentityKeyPair) -> Result<T, String>,
+        operation: impl FnOnce(&IdentityKeyPair, &VaultOwner) -> Result<T, String>,
     ) -> Result<T, String> {
-        let user_id = user_id.trim();
+        self.with_vault(|identity, owner, _| operation(identity, owner))
+    }
 
-        if user_id.is_empty() {
-            return Err("Clerk kullanıcı kimliği boş olamaz.".to_string());
-        }
-
-        let mut guard = self
-            .vault
-            .lock()
-            .map_err(|_| "Vault session lock poisoned".to_string())?;
+    /// `with_identity` gibi; ayrıca kasadaki gizli anahtar deposuna erişir.
+    pub fn with_vault<T>(
+        &self,
+        operation: impl FnOnce(&IdentityKeyPair, &VaultOwner, &PlatformKeyStore) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let mut guard = self.guard()?;
 
         if Self::expire_if_needed(&mut guard, self.idle_timeout)? {
             return Err("Kasa hareketsizlik nedeniyle kilitlendi.".to_string());
         }
 
-        if Self::remove_if_wrong_user(&mut guard, user_id)? {
-            return Err(
-                "Kasa başka bir Clerk hesabına bağlıydı ve güvenlik için kilitlendi."
-                    .to_string(),
-            );
-        }
-
-        let unlocked = guard.as_mut().ok_or_else(|| "Vault is locked".to_string())?;
+        let unlocked = guard.as_mut().ok_or_else(|| "Kasa kilitli.".to_string())?;
 
         unlocked.last_activity = Instant::now();
 
-        operation(&unlocked.identity)
+        operation(&unlocked.identity, &unlocked.owner, &unlocked.key_store)
+    }
+
+    pub fn set_pending_master_key(&self, protected: ProtectedMasterKey) -> Result<(), String> {
+        let mut guard = self.guard()?;
+        let unlocked = guard.as_mut().ok_or_else(|| "Kasa kilitli.".to_string())?;
+
+        unlocked.pending_master_key = Some(protected);
+        Ok(())
+    }
+
+    pub fn take_pending_master_key(&self) -> Result<(VaultOwner, ProtectedMasterKey), String> {
+        let mut guard = self.guard()?;
+        let unlocked = guard.as_mut().ok_or_else(|| "Kasa kilitli.".to_string())?;
+
+        let protected = unlocked
+            .pending_master_key
+            .take()
+            .ok_or_else(|| "Bekleyen parola değişikliği yok.".to_string())?;
+
+        Ok((unlocked.owner.clone(), protected))
     }
 }
 
@@ -214,15 +188,18 @@ mod tests {
     use super::*;
     use std::thread;
 
-    fn create_unlocked_session(idle_timeout: Duration, user_id: &str) -> VaultSession {
+    fn owner(email: &str) -> VaultOwner {
+        VaultOwner {
+            email: email.to_string(),
+            user_id: format!("id-{email}"),
+        }
+    }
+
+    fn create_unlocked_session(idle_timeout: Duration, email: &str) -> VaultSession {
         let session = VaultSession::with_idle_timeout(idle_timeout);
 
         session
-            .unlock(
-                IdentityKeyPair::generate(),
-                PlatformKeyStore::new(),
-                user_id.to_string(),
-            )
+            .unlock(IdentityKeyPair::generate(), PlatformKeyStore::new(), owner(email))
             .expect("session should unlock");
 
         session
@@ -230,9 +207,9 @@ mod tests {
 
     #[test]
     fn idle_session_is_locked() {
-        let session = create_unlocked_session(Duration::from_millis(50), "test-user");
+        let session = create_unlocked_session(Duration::from_millis(50), "a@x.com");
 
-        assert!(session.is_unlocked_for_user("test-user").unwrap());
+        assert!(session.is_unlocked().unwrap());
 
         thread::sleep(Duration::from_millis(100));
 
@@ -242,12 +219,12 @@ mod tests {
 
     #[test]
     fn recent_activity_resets_idle_timeout() {
-        let session = create_unlocked_session(Duration::from_millis(300), "test-user");
+        let session = create_unlocked_session(Duration::from_millis(300), "a@x.com");
 
         thread::sleep(Duration::from_millis(180));
 
         session
-            .record_activity_for_user("test-user")
+            .record_activity()
             .expect("activity should extend the timeout");
 
         thread::sleep(Duration::from_millis(180));
@@ -261,36 +238,29 @@ mod tests {
     }
 
     #[test]
-    fn wrong_user_locks_the_current_session() {
-        let session = create_unlocked_session(Duration::from_secs(30), "user-a");
+    fn unlocking_another_account_replaces_the_session() {
+        let session = create_unlocked_session(Duration::from_secs(30), "a@x.com");
 
-        assert!(!session.is_unlocked_for_user("user-b").unwrap());
-        assert!(!session.is_unlocked().unwrap());
-    }
+        session
+            .unlock(IdentityKeyPair::generate(), PlatformKeyStore::new(), owner("b@x.com"))
+            .unwrap();
 
-    #[test]
-    fn wrong_user_cannot_use_the_identity() {
-        let session = create_unlocked_session(Duration::from_secs(30), "user-a");
-
-        let result = session.with_identity_for_user("user-b", |_| Ok(()));
-
-        assert!(result.is_err());
-        assert!(!session.is_unlocked().unwrap());
+        assert_eq!(session.current_owner().unwrap(), Some(owner("b@x.com")));
     }
 
     #[test]
     fn expired_session_cannot_be_revived_by_activity() {
-        let session = create_unlocked_session(Duration::from_millis(50), "test-user");
+        let session = create_unlocked_session(Duration::from_millis(50), "a@x.com");
 
         thread::sleep(Duration::from_millis(100));
 
-        assert!(session.record_activity_for_user("test-user").is_err());
+        assert!(session.record_activity().is_err());
         assert!(!session.is_unlocked().unwrap());
     }
 
     #[test]
     fn manual_lock_is_idempotent() {
-        let session = create_unlocked_session(Duration::from_secs(30), "test-user");
+        let session = create_unlocked_session(Duration::from_secs(30), "a@x.com");
 
         session.lock().expect("manual lock should succeed");
         session
@@ -298,5 +268,22 @@ mod tests {
             .expect("locking an already locked vault should succeed");
 
         assert!(!session.is_unlocked().unwrap());
+    }
+
+    #[test]
+    fn pending_master_key_is_cleared_on_lock() {
+        let session = create_unlocked_session(Duration::from_secs(30), "a@x.com");
+
+        session
+            .set_pending_master_key(ProtectedMasterKey {
+                ciphertext: vec![1],
+                nonce: [0; 12],
+                kdf_version: 2,
+            })
+            .unwrap();
+
+        session.lock().unwrap();
+
+        assert!(session.take_pending_master_key().is_err());
     }
 }

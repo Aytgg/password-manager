@@ -2,14 +2,15 @@
 //!
 //! Her kayıt rastgele bir DEK ile şifrelenir. Kayıt iki ayrı şifreli alan
 //! taşır: meta veri (başlık, kullanıcı adı) ve gizli değer (parola). Böylece
-//! liste görüntülenirken parolanın kendisi çözülmez. DEK, erişimi olan her
-//! kullanıcının X25519 açık anahtarına ayrı ayrı paketlenir. Sunucu yalnızca
-//! şifreli veriyi ve paketlenmiş anahtarları görür.
+//! liste görüntülenirken parolanın kendisi çözülmez. DEK, doğrudan erişimi
+//! olan her kullanıcının ve paylaşıldığı her departmanın X25519 açık
+//! anahtarına ayrı ayrı paketlenir. Sunucu yalnızca şifreli veriyi ve
+//! paketlenmiş anahtarları görür.
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
-use x25519_dalek::PublicKey;
+use x25519_dalek::{PublicKey, StaticSecret};
 use zeroize::Zeroizing;
 
 use crate::crypto::{
@@ -37,7 +38,23 @@ pub struct WrappedKeyDto {
     pub ciphertext: String,
 }
 
-/// Convex'ten gelen bir kayıt ve çağıran kullanıcıya ait paketlenmiş DEK.
+/// Çağıranın kaydın DEK'ine ulaşma yolu.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum ItemAccess {
+    /// DEK doğrudan çağıranın açık anahtarına paketli.
+    #[serde(rename_all = "camelCase")]
+    Direct { access: WrappedKeyDto },
+    /// DEK departmanın açık anahtarına, departmanın özel anahtarı da
+    /// çağıranın açık anahtarına paketli.
+    #[serde(rename_all = "camelCase")]
+    Department {
+        department_key: WrappedKeyDto,
+        item_key: WrappedKeyDto,
+    },
+}
+
+/// Convex'ten gelen bir kayıt ve çağıranın ona erişim yolu.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EncryptedItem {
@@ -45,7 +62,7 @@ pub struct EncryptedItem {
     pub owner_id: String,
     pub metadata: SealedField,
     pub secret: SealedField,
-    pub access: WrappedKeyDto,
+    pub access: ItemAccess,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -64,10 +81,26 @@ pub struct Recipient {
     pub public_key: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RecipientAccess {
     pub user_id: String,
+    pub access: WrappedKeyDto,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DepartmentRecipient {
+    pub department_id: String,
+    pub key_version: u32,
+    pub public_key: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DepartmentAccess {
+    pub department_id: String,
+    pub key_version: u32,
     pub access: WrappedKeyDto,
 }
 
@@ -77,6 +110,7 @@ pub struct RekeyedItem {
     pub metadata: SealedField,
     pub secret: SealedField,
     pub accesses: Vec<RecipientAccess>,
+    pub department_accesses: Vec<DepartmentAccess>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -120,7 +154,7 @@ pub fn encode_public_key(public_key: &PublicKey) -> String {
     BASE64.encode(public_key.as_bytes())
 }
 
-fn decode_public_key(value: &str) -> Result<PublicKey, String> {
+pub(crate) fn decode_public_key(value: &str) -> Result<PublicKey, String> {
     Ok(PublicKey::from(decode_fixed::<32>(value, "Açık anahtar")?))
 }
 
@@ -140,8 +174,8 @@ fn open(field: &SealedField, dek: &[u8; 32], aad: &[u8]) -> Result<Zeroizing<Vec
     password_encryption::decrypt_password(&ciphertext, &nonce, dek, aad)
 }
 
-fn wrap_for(dek: &[u8; 32], public_key: &PublicKey) -> Result<WrappedKeyDto, String> {
-    let wrapped = key_wrap::wrap_dek(dek, public_key)?;
+pub(crate) fn wrap_for(key: &[u8; 32], public_key: &PublicKey) -> Result<WrappedKeyDto, String> {
+    let wrapped = key_wrap::wrap_dek(key, public_key)?;
 
     Ok(WrappedKeyDto {
         ephemeral_public_key: BASE64.encode(wrapped.ephemeral_public_key),
@@ -150,8 +184,10 @@ fn wrap_for(dek: &[u8; 32], public_key: &PublicKey) -> Result<WrappedKeyDto, Str
     })
 }
 
-fn unwrap_own_dek(
-    identity: &IdentityKeyPair,
+/// Paketlenmiş 32 baytlık bir anahtarı (DEK ya da departman özel anahtarı)
+/// verilen özel anahtarla açar.
+pub(crate) fn unwrap_key(
+    private_key: &StaticSecret,
     access: &WrappedKeyDto,
 ) -> Result<Zeroizing<[u8; 32]>, String> {
     let wrapped = WrappedKey {
@@ -160,8 +196,27 @@ fn unwrap_own_dek(
         ciphertext: decode_vec(&access.ciphertext, "Paketlenmiş anahtar")?,
     };
 
-    key_wrap::unwrap_dek(&wrapped, &identity.private_secret())
-        .map_err(|_| "Kaydın anahtarı bu hesabın kimlik anahtarıyla açılamadı.".to_string())
+    key_wrap::unwrap_dek(&wrapped, private_key)
+}
+
+fn unwrap_item_dek(
+    identity: &IdentityKeyPair,
+    item: &EncryptedItem,
+) -> Result<Zeroizing<[u8; 32]>, String> {
+    let failed = |_| "Kaydın anahtarı bu hesabın kimlik anahtarıyla açılamadı.".to_string();
+
+    match &item.access {
+        ItemAccess::Direct { access } => unwrap_key(&identity.private_secret(), access).map_err(failed),
+        ItemAccess::Department {
+            department_key,
+            item_key,
+        } => {
+            let department_private = unwrap_key(&identity.private_secret(), department_key)
+                .map_err(|_| "Departman anahtarı bu hesabın kimlik anahtarıyla açılamadı.".to_string())?;
+
+            unwrap_key(&StaticSecret::from(*department_private), item_key).map_err(failed)
+        }
+    }
 }
 
 fn validate_metadata(metadata: &ItemMetadata) -> Result<(), String> {
@@ -243,7 +298,7 @@ pub fn decrypt_metadata(
     identity: &IdentityKeyPair,
     item: &EncryptedItem,
 ) -> Result<ItemMetadata, String> {
-    let dek = unwrap_own_dek(identity, &item.access)?;
+    let dek = unwrap_item_dek(identity, item)?;
     let plaintext = open(&item.metadata, &dek, &metadata_aad(&item.owner_id, &item.item_id))?;
 
     serde_json::from_slice(&plaintext)
@@ -254,7 +309,7 @@ pub fn decrypt_secret(
     identity: &IdentityKeyPair,
     item: &EncryptedItem,
 ) -> Result<Zeroizing<Vec<u8>>, String> {
-    let dek = unwrap_own_dek(identity, &item.access)?;
+    let dek = unwrap_item_dek(identity, item)?;
 
     open(&item.secret, &dek, &secret_aad(&item.owner_id, &item.item_id))
 }
@@ -269,7 +324,7 @@ pub fn wrap_for_recipient(
     item: &EncryptedItem,
     recipient_public_key: &str,
 ) -> Result<WrappedKeyDto, String> {
-    let dek = unwrap_own_dek(identity, &item.access)?;
+    let dek = unwrap_item_dek(identity, item)?;
 
     // Kaydın gerçekten bu DEK ile şifrelendiğini doğrula; aksi halde alıcıya
     // işe yaramayan bir anahtar verilmiş olur.
@@ -278,18 +333,19 @@ pub fn wrap_for_recipient(
     wrap_for(&dek, &decode_public_key(recipient_public_key)?)
 }
 
-/// Kaydı yeni bir DEK ile yeniden şifreler ve yalnızca `recipients` ile
-/// sahibin kendisi için yeni anahtar paketleri üretir. Listede olmayan
-/// kullanıcıların elindeki eski DEK yeni veriyi açamaz.
+/// Kaydı yeni bir DEK ile yeniden şifreler ve yalnızca `recipients`,
+/// `departments` ile sahibin kendisi için yeni anahtar paketleri üretir.
+/// Listede olmayanların elindeki eski DEK yeni veriyi açamaz.
 pub fn rekey(
     identity: &IdentityKeyPair,
     owner_id: &str,
     item: &EncryptedItem,
     recipients: &[Recipient],
+    departments: &[DepartmentRecipient],
 ) -> Result<RekeyedItem, String> {
     require_owner(owner_id, item)?;
 
-    let old_dek = unwrap_own_dek(identity, &item.access)?;
+    let old_dek = unwrap_item_dek(identity, item)?;
     let metadata_aad = metadata_aad(&item.owner_id, &item.item_id);
     let secret_aad = secret_aad(&item.owner_id, &item.item_id);
 
@@ -316,10 +372,22 @@ pub fn rekey(
         });
     }
 
+    let department_accesses = departments
+        .iter()
+        .map(|department| {
+            Ok(DepartmentAccess {
+                department_id: department.department_id.clone(),
+                key_version: department.key_version,
+                access: wrap_for(&new_dek, &decode_public_key(&department.public_key)?)?,
+            })
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+
     Ok(RekeyedItem {
         metadata: seal(&metadata, &new_dek, &metadata_aad)?,
         secret: seal(&secret, &new_dek, &secret_aad)?,
         accesses,
+        department_accesses,
     })
 }
 
@@ -333,7 +401,7 @@ mod tests {
             owner_id: owner_id.to_string(),
             metadata: new_item.metadata.clone(),
             secret: new_item.secret.clone(),
-            access,
+            access: ItemAccess::Direct { access },
         }
     }
 
@@ -384,7 +452,7 @@ mod tests {
         let new_item = encrypt_new_item(&owner, "owner", "VPN", None, b"pw").unwrap();
         let item = stored(&new_item, "owner", new_item.owner_access.clone());
 
-        assert!(rekey(&other, "other", &item, &[]).is_err());
+        assert!(rekey(&other, "other", &item, &[], &[]).is_err());
     }
 
     #[test]
@@ -444,6 +512,7 @@ mod tests {
                 user_id: "kept".to_string(),
                 public_key: encode_public_key(&kept.public_key()),
             }],
+            &[],
         )
         .unwrap();
 
@@ -455,7 +524,7 @@ mod tests {
             owner_id: "owner".to_string(),
             metadata: rekeyed.metadata.clone(),
             secret: rekeyed.secret.clone(),
-            access,
+            access: ItemAccess::Direct { access },
         };
 
         assert_eq!(
@@ -467,6 +536,62 @@ mod tests {
 
         // Eski paketlenmiş anahtar yeni şifreli veriyi açamaz.
         assert!(decrypt_secret(&removed, &after(removed_access)).is_err());
+    }
+
+    #[test]
+    fn department_member_decrypts_through_the_department_key() {
+        let owner = IdentityKeyPair::generate();
+        let department = IdentityKeyPair::generate();
+        let member = IdentityKeyPair::generate();
+
+        let new_item = encrypt_new_item(&owner, "owner", "VPN", None, b"pw").unwrap();
+        let owner_item = stored(&new_item, "owner", new_item.owner_access.clone());
+
+        let item_key =
+            wrap_for_recipient(&owner, &owner_item, &encode_public_key(&department.public_key()))
+                .unwrap();
+        let department_key = wrap_for(department.private_key(), &member.public_key()).unwrap();
+
+        let member_item = EncryptedItem {
+            access: ItemAccess::Department {
+                department_key,
+                item_key,
+            },
+            ..owner_item.clone()
+        };
+
+        assert_eq!(decrypt_secret(&member, &member_item).unwrap().as_slice(), b"pw");
+        assert!(decrypt_secret(&IdentityKeyPair::generate(), &member_item).is_err());
+    }
+
+    #[test]
+    fn rekey_wraps_the_new_key_for_departments() {
+        let owner = IdentityKeyPair::generate();
+        let department = IdentityKeyPair::generate();
+
+        let new_item = encrypt_new_item(&owner, "owner", "VPN", None, b"pw").unwrap();
+        let owner_item = stored(&new_item, "owner", new_item.owner_access.clone());
+
+        let rekeyed = rekey(
+            &owner,
+            "owner",
+            &owner_item,
+            &[],
+            &[DepartmentRecipient {
+                department_id: "d1".to_string(),
+                key_version: 3,
+                public_key: encode_public_key(&department.public_key()),
+            }],
+        )
+        .unwrap();
+
+        assert_eq!(rekeyed.department_accesses.len(), 1);
+        assert_eq!(rekeyed.department_accesses[0].key_version, 3);
+
+        let dek = unwrap_key(&department.private_secret(), &rekeyed.department_accesses[0].access)
+            .unwrap();
+        let plaintext = open(&rekeyed.secret, &dek, &secret_aad("owner", &new_item.item_id)).unwrap();
+        assert_eq!(plaintext.as_slice(), b"pw");
     }
 
     #[test]

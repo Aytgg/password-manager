@@ -33,7 +33,13 @@ async function insertDepartment(ctx: MutationCtx, rawName: string) {
     return existing._id;
   }
 
-  return await ctx.db.insert("departments", { name, createdAt: Date.now() });
+  // Anahtar, bir yöneticinin cihazında arka planda üretilir (keys.pendingWork).
+  return await ctx.db.insert("departments", {
+    name,
+    keyVersion: 0,
+    needsRotation: false,
+    createdAt: Date.now(),
+  });
 }
 
 export const create = mutation({

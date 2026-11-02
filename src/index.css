@@ -118,32 +118,29 @@ input {
   text-align: center;
 }
 
-/* Clerk layout fixes */
-
-.auth-panel .cl-rootBox,
-.auth-panel .cl-card,
-.auth-panel .cl-signIn-root,
-.auth-panel .cl-signUp-root {
-  width: 100%;
+.auth-panel .vault-form {
   max-width: 100%;
-  min-width: 0;
 }
 
-.auth-panel .cl-card {
+.auth-link {
+  align-self: flex-start;
   padding: 0;
   border: 0;
-  box-shadow: none;
-  background: transparent;
+  background: none;
+  color: var(--accent);
+  font-size: 0.875rem;
+  cursor: pointer;
 }
 
-.auth-panel .cl-formFieldInput,
-.auth-panel .cl-formButtonPrimary,
-.auth-panel .cl-socialButtonsBlockButton {
-  max-width: 100%;
+.auth-link:hover {
+  text-decoration: underline;
 }
 
-.auth-panel .cl-footer {
-  background: transparent;
+.auth-hint {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.8125rem;
+  line-height: 1.5;
 }
 
 /* Vault layout */
@@ -279,6 +276,15 @@ input {
   height: 7px;
   border-radius: 50%;
   background: #fbbf24;
+}
+
+.vault-status.online {
+  border-color: #1f3d2b;
+  color: #4ade80;
+}
+
+.vault-status.online .vault-status-dot {
+  background: #4ade80;
 }
 
 .vault-empty {

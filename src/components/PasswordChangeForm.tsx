@@ -1,7 +1,9 @@
 import { invoke } from "@tauri-apps/api/core";
+import { useAction } from "convex/react";
 import { useState } from "react";
 import type React from "react";
 
+import { api } from "../../convex/_generated/api";
 import { errorMessage } from "../errors";
 
 const MIN_LENGTH = 8;
@@ -39,12 +41,23 @@ const styles: Record<string, React.CSSProperties> = {
 };
 
 type Props = {
-  hasVault: boolean;
-  getSessionToken: () => Promise<string>;
+  email: string;
+  isOnline: boolean;
+  onChanged: (newAuthSecret: string) => void;
 };
 
-/** Kasa ana parolasını değiştirir. Hesap (Clerk) şifresinden bağımsızdır. */
-export default function MasterPasswordForm({ hasVault, getSessionToken }: Props) {
+type PasswordChangeSecrets = {
+  currentAuthSecret: string;
+  newAuthSecret: string;
+};
+
+/**
+ * Hesap parolasını değiştirir. Aynı parola kasayı da koruduğu için değişiklik
+ * hem sunucuda hem bu cihazdaki kasada yapılır; bu yüzden bağlantı gerekir.
+ */
+export default function PasswordChangeForm({ email, isOnline, onChanged }: Props) {
+  const changePassword = useAction(api.auth.changePassword);
+
   const [currentPassword, setCurrentPassword] = useState("");
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
@@ -58,7 +71,9 @@ export default function MasterPasswordForm({ hasVault, getSessionToken }: Props)
     setConfirmPassword("");
   }
 
-  async function handleSubmit(event: React.FormEvent<HTMLFormElement>) {
+  async function handleSubmit(
+    event: Parameters<NonNullable<React.ComponentProps<"form">["onSubmit"]>>[0],
+  ) {
     event.preventDefault();
 
     if (saving) return;
@@ -67,7 +82,7 @@ export default function MasterPasswordForm({ hasVault, getSessionToken }: Props)
     setSuccess("");
 
     if (newPassword.length < MIN_LENGTH) {
-      setError(`Yeni ana parola en az ${MIN_LENGTH} karakter olmalı.`);
+      setError(`Yeni parola en az ${MIN_LENGTH} karakter olmalı.`);
       return;
     }
 
@@ -79,15 +94,29 @@ export default function MasterPasswordForm({ hasVault, getSessionToken }: Props)
     setSaving(true);
 
     try {
-      await invoke("change_master_password", {
-        sessionToken: await getSessionToken(),
+      // Önce yerelde doğrulanır ve yeni koruma bellekte hazırlanır; sunucu
+      // kabul edince diske yazılır. Böylece iki taraf ayrışmaz.
+      const secrets = await invoke<PasswordChangeSecrets>("prepare_password_change", {
         currentPassword,
         newPassword,
       });
 
-      setSuccess(
-        "Ana parola değiştirildi. Kasayı bir sonraki açışında yeni parolayı kullan.",
-      );
+      await changePassword({
+        currentSecret: secrets.currentAuthSecret,
+        newSecret: secrets.newAuthSecret,
+      });
+
+      try {
+        await invoke("commit_password_change");
+      } catch (err) {
+        setError(
+          `Sunucudaki parolan değişti ancak bu cihazdaki kasa güncellenemedi: ${errorMessage(err)}. Çevrimdışı girişte eski parolanı kullan.`,
+        );
+        return;
+      }
+
+      onChanged(secrets.newAuthSecret);
+      setSuccess("Parola değiştirildi. Diğer cihazlardaki oturumlar kapatıldı.");
     } catch (err) {
       setError(errorMessage(err));
     } finally {
@@ -98,20 +127,20 @@ export default function MasterPasswordForm({ hasVault, getSessionToken }: Props)
 
   return (
     <section style={styles.section}>
-      <h2 style={{ marginTop: 0 }}>Kasa ana parolası</h2>
+      <h2 style={{ marginTop: 0 }}>Parola</h2>
 
       <p style={styles.muted}>
-        Ana parola, bu cihazdaki kasanı şifreler ve hesap şifrenden ayrıdır.
-        Unutulursa kurtarılamaz; yeni parolayı güvenli bir yerde sakla.
+        {email} hesabının parolası; hem girişi hem kasanın şifrelemesini korur.
+        Unutulursa kurtarılamaz.
       </p>
 
-      {!hasVault ? (
-        <p style={styles.muted}>Bu cihazda henüz kasan yok.</p>
+      {!isOnline ? (
+        <p style={styles.muted}>Parola değiştirmek için sunucu bağlantısı gerekli.</p>
       ) : (
         <form onSubmit={handleSubmit}>
-          <label htmlFor="current-master-password">Mevcut ana parola</label>
+          <label htmlFor="current-account-password">Mevcut parola</label>
           <input
-            id="current-master-password"
+            id="current-account-password"
             type="password"
             autoComplete="current-password"
             style={styles.input}
@@ -121,9 +150,9 @@ export default function MasterPasswordForm({ hasVault, getSessionToken }: Props)
             required
           />
 
-          <label htmlFor="new-master-password">Yeni ana parola</label>
+          <label htmlFor="new-account-password">Yeni parola</label>
           <input
-            id="new-master-password"
+            id="new-account-password"
             type="password"
             autoComplete="new-password"
             style={styles.input}
@@ -135,9 +164,9 @@ export default function MasterPasswordForm({ hasVault, getSessionToken }: Props)
             required
           />
 
-          <label htmlFor="confirm-master-password">Yeni ana parola tekrarı</label>
+          <label htmlFor="confirm-account-password">Yeni parola tekrarı</label>
           <input
-            id="confirm-master-password"
+            id="confirm-account-password"
             type="password"
             autoComplete="new-password"
             style={styles.input}
@@ -165,7 +194,7 @@ export default function MasterPasswordForm({ hasVault, getSessionToken }: Props)
             style={{ ...styles.button, opacity: saving ? 0.6 : 1 }}
             disabled={saving}
           >
-            {saving ? "Değiştiriliyor..." : "Ana parolayı değiştir"}
+            {saving ? "Değiştiriliyor..." : "Parolayı değiştir"}
           </button>
         </form>
       )}

@@ -1,12 +1,10 @@
 import { useState } from "react";
-import { useAuth } from "@clerk/react";
 import { invoke } from "@tauri-apps/api/core";
 
-export function DevVaultResetButton() {
+export function DevVaultResetButton({ email }: { email: string }) {
   const [confirming, setConfirming] = useState(false);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const { getToken } = useAuth();
 
   // Never render this control in a production frontend build.
   if (!import.meta.env.DEV) {
@@ -18,14 +16,8 @@ export function DevVaultResetButton() {
     setError(null);
 
     try {
-      const sessionToken = await getToken();
-
-      if (!sessionToken) {
-        throw new Error("Clerk oturum token'ı alınamadı.");
-      }
-
-      // Yalnızca oturumdaki hesabın bu cihazdaki kasası silinir.
-      await invoke<void>("reset_vault", { sessionToken });
+      // Yalnızca bu hesabın bu cihazdaki kasası silinir.
+      await invoke<void>("reset_vault", { email });
 
       // Reload so the application checks the new vault state.
       window.location.reload();
