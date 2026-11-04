@@ -8,6 +8,7 @@ import type { Id } from "../convex/_generated/dataModel";
 import { errorMessage } from "./errors";
 import {
   toEncryptedItem,
+  type Folder,
   type GrantTarget,
   type HistoryRecord,
   type NewItem,
@@ -170,6 +171,22 @@ const icons = {
     </>
   ),
   check: <path d="m5 12 5 5 9-10" />,
+  folder: <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />,
+  folderPlus: (
+    <>
+      <path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
+      <path d="M12 11v5" />
+      <path d="M9.5 13.5h5" />
+    </>
+  ),
+  keyPlus: (
+    <>
+      <circle cx="8" cy="15" r="4" />
+      <path d="m10.85 12.15 6.15-6.15" />
+      <path d="M19 3v6" />
+      <path d="M16 6h6" />
+    </>
+  ),
   dash: <path d="M6 12h12" />,
 };
 
@@ -906,15 +923,341 @@ function formatSyncedAt(timestamp: number | null) {
   });
 }
 
+/** Klasör ağacı yardımcıları. */
+function folderTree(folders: Folder[]) {
+  const byId = new Map(folders.map((folder) => [folder.id, folder]));
+  const children = new Map<Id<"folders"> | null, Folder[]>();
+
+  for (const folder of folders) {
+    const parent = folder.parentId && byId.has(folder.parentId) ? folder.parentId : null;
+    children.set(parent, [...(children.get(parent) ?? []), folder]);
+  }
+
+  for (const list of children.values()) {
+    list.sort((a, b) => a.name.localeCompare(b.name, "tr", { sensitivity: "base" }));
+  }
+
+  const path = (id: Id<"folders"> | null): Folder[] => {
+    const chain: Folder[] = [];
+    let current = id ? byId.get(id) : undefined;
+
+    while (current && chain.length < 50) {
+      chain.unshift(current);
+      current = current.parentId ? byId.get(current.parentId) : undefined;
+    }
+
+    return chain;
+  };
+
+  const descendants = (id: Id<"folders">): Set<Id<"folders">> => {
+    const result = new Set<Id<"folders">>([id]);
+    const stack = [id];
+
+    while (stack.length > 0) {
+      for (const child of children.get(stack.pop()!) ?? []) {
+        if (!result.has(child.id)) {
+          result.add(child.id);
+          stack.push(child.id);
+        }
+      }
+    }
+
+    return result;
+  };
+
+  return {
+    byId,
+    childrenOf: (id: Id<"folders"> | null) => children.get(id) ?? [],
+    path,
+    pathText: (id: Id<"folders"> | null) =>
+      id && byId.has(id) ? path(id).map((folder) => folder.name).join(" / ") : "Kök",
+    descendants,
+  };
+}
+
+type FolderTree = ReturnType<typeof folderTree>;
+
+/** Hedef klasör seçimi: kök ve yönetilebilen klasörler, tam yolu ile. */
+function FolderSelect({
+  tree,
+  value,
+  exclude,
+  disabled,
+  label,
+  onChange,
+}: {
+  tree: FolderTree;
+  value: Id<"folders"> | null;
+  exclude?: Set<Id<"folders">>;
+  disabled?: boolean;
+  label: string;
+  onChange: (folderId: Id<"folders"> | null) => void;
+}) {
+  const options = [...tree.byId.values()]
+    .filter((folder) => folder.canManage && !exclude?.has(folder.id))
+    .map((folder) => ({ id: folder.id, text: tree.pathText(folder.id) }))
+    .sort((a, b) => a.text.localeCompare(b.text, "tr"));
+
+  return (
+    <select
+      style={{ ...styles.input, marginBottom: 0, width: "auto", minWidth: 200 }}
+      value={value ?? ""}
+      disabled={disabled}
+      aria-label={label}
+      onChange={(event) => onChange((event.target.value || null) as Id<"folders"> | null)}
+    >
+      <option value="">Kök</option>
+      {options.map((option) => (
+        <option key={option.id} value={option.id}>
+          {option.text}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+function NewFolderForm({
+  parentId,
+  tree,
+  onCreated,
+  onCancel,
+}: {
+  parentId: Id<"folders"> | null;
+  tree: FolderTree;
+  onCreated: (id: Id<"folders">, name: string) => void;
+  onCancel: () => void;
+}) {
+  const createFolder = useMutation(api.folders.create);
+  const [name, setName] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState("");
+
+  return (
+    <form
+      style={{ maxWidth: 520 }}
+      onSubmit={(event) => {
+        event.preventDefault();
+        if (saving) return;
+        setSaving(true);
+        setError("");
+        createFolder({ name, parentId: parentId ?? undefined })
+          .then((id) => onCreated(id, name.trim()))
+          .catch((err: unknown) => setError(errorMessage(err)))
+          .finally(() => setSaving(false));
+      }}
+    >
+      <h3 style={{ marginTop: 0 }}>Yeni klasör</h3>
+      <p style={{ ...styles.muted, fontSize: 13 }}>Konum: {tree.pathText(parentId)}</p>
+
+      <label htmlFor="folder-name">Klasör adı</label>
+      <input
+        id="folder-name"
+        style={styles.input}
+        value={name}
+        onChange={(event) => setName(event.target.value)}
+        maxLength={100}
+        required
+        autoFocus
+      />
+
+      {error && (
+        <p role="alert" style={styles.error}>
+          {error}
+        </p>
+      )}
+
+      <div style={{ display: "flex", gap: 8 }}>
+        <button type="submit" style={{ ...styles.button, opacity: saving ? 0.6 : 1 }} disabled={saving}>
+          {saving ? "Oluşturuluyor..." : "Klasörü oluştur"}
+        </button>
+        <button type="button" style={styles.secondaryButton} onClick={onCancel} disabled={saving}>
+          Vazgeç
+        </button>
+      </div>
+    </form>
+  );
+}
+
+/** Seçili klasörün bilgileri ve (yönetebiliyorsa) ad, konum, silme. */
+function FolderDetail({
+  folder,
+  tree,
+  itemCount,
+  isOnline,
+  onMessage,
+  onDeleted,
+}: {
+  folder: Folder;
+  tree: FolderTree;
+  itemCount: number;
+  isOnline: boolean;
+  onMessage: (message: string) => void;
+  onDeleted: () => void;
+}) {
+  const renameFolder = useMutation(api.folders.rename);
+  const moveFolder = useMutation(api.folders.move);
+  const removeFolder = useMutation(api.folders.remove);
+
+  const [name, setName] = useState(folder.name);
+  const [busy, setBusy] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    setName(folder.name);
+    setConfirming(false);
+    setError("");
+  }, [folder.id, folder.name]);
+
+  const editable = folder.canManage && isOnline;
+
+  function run(task: () => Promise<unknown>, message: string, after?: () => void) {
+    if (busy) return;
+    setBusy(true);
+    setError("");
+    task()
+      .then(() => {
+        onMessage(message);
+        after?.();
+      })
+      .catch((err: unknown) => setError(errorMessage(err)))
+      .finally(() => setBusy(false));
+  }
+
+  return (
+    <div>
+      <dl style={detailGrid}>
+        <dt style={styles.muted}>Konum</dt>
+        <dd style={{ margin: 0 }}>{tree.pathText(folder.parentId)}</dd>
+        <dt style={styles.muted}>İçerik</dt>
+        <dd style={{ margin: 0 }}>
+          {tree.childrenOf(folder.id).length} klasör, {itemCount} parola
+        </dd>
+        <dt style={styles.muted}>Sahip</dt>
+        <dd style={{ margin: 0 }}>{folder.isOwner ? "Sen" : "Başka bir kullanıcı"}</dd>
+      </dl>
+
+      {!folder.canManage ? (
+        <p style={styles.muted}>Bu klasörü yalnızca sahibi ya da bir yönetici düzenleyebilir.</p>
+      ) : (
+        <div style={{ display: "grid", gap: 18, borderTop: "1px solid #27272a", paddingTop: 16 }}>
+          {!isOnline && <p style={{ ...styles.muted, margin: 0 }}>Klasör işlemleri için bağlantı gerekli.</p>}
+
+          <form
+            style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}
+            onSubmit={(event) => {
+              event.preventDefault();
+              run(() => renameFolder({ id: folder.id, name }), "Klasör adı güncellendi.");
+            }}
+          >
+            <label htmlFor="folder-rename" style={{ ...styles.muted, minWidth: 70 }}>
+              Ad
+            </label>
+            <input
+              id="folder-rename"
+              style={{ ...styles.input, marginBottom: 0, marginTop: 0, flex: 1, minWidth: 180 }}
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              maxLength={100}
+              disabled={!editable || busy}
+              required
+            />
+            <button
+              type="submit"
+              style={styles.secondaryButton}
+              disabled={!editable || busy || name.trim() === folder.name}
+            >
+              Kaydet
+            </button>
+          </form>
+
+          <div style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+            <span style={{ ...styles.muted, minWidth: 70 }}>Taşı</span>
+            <FolderSelect
+              tree={tree}
+              value={folder.parentId}
+              exclude={tree.descendants(folder.id)}
+              disabled={!editable || busy}
+              label="Klasörün taşınacağı yer"
+              onChange={(parentId) =>
+                run(() => moveFolder({ id: folder.id, parentId }), "Klasör taşındı.")
+              }
+            />
+          </div>
+
+          <div>
+            {confirming ? (
+              <>
+                <p style={{ ...styles.error, marginTop: 0 }}>
+                  Klasör silinecek. İçindeki {itemCount} parola ve{" "}
+                  {tree.childrenOf(folder.id).length} alt klasör "{tree.pathText(folder.parentId)}"
+                  konumuna taşınır; hiçbir parola silinmez.
+                </p>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button
+                    type="button"
+                    style={{ ...styles.button, background: "#dc2626" }}
+                    disabled={!editable || busy}
+                    onClick={() =>
+                      run(() => removeFolder({ id: folder.id }), "Klasör silindi.", onDeleted)
+                    }
+                  >
+                    {busy ? "Siliniyor..." : "Evet, klasörü sil"}
+                  </button>
+                  <button
+                    type="button"
+                    style={styles.secondaryButton}
+                    onClick={() => setConfirming(false)}
+                    disabled={busy}
+                  >
+                    Vazgeç
+                  </button>
+                </div>
+              </>
+            ) : (
+              <button
+                type="button"
+                style={{ ...styles.secondaryButton, color: "#f87171" }}
+                onClick={() => setConfirming(true)}
+                disabled={!editable || busy}
+              >
+                Klasörü sil
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {error && (
+        <p role="alert" style={styles.error}>
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
+const detailGrid: React.CSSProperties = {
+  display: "grid",
+  gridTemplateColumns: "max-content 1fr",
+  gap: "8px 18px",
+  margin: "0 0 24px",
+  fontSize: 14,
+};
+
 /** Yeni parola formu; kayıt önce bu cihazda kuyruğa alınır. */
 function NewItemForm({
   data,
   isOnline,
+  folderId,
+  tree,
   onCreated,
   onCancel,
 }: {
   data: VaultData;
   isOnline: boolean;
+  folderId: Id<"folders"> | null;
+  tree: FolderTree;
   onCreated: (itemId: string, message: string) => void;
   onCancel: () => void;
 }) {
@@ -945,7 +1288,7 @@ function NewItemForm({
         password,
       });
 
-      data.addItem(encrypted);
+      data.addItem(encrypted, folderId);
       onCreated(
         encrypted.itemId,
         isOnline
@@ -962,6 +1305,7 @@ function NewItemForm({
   return (
     <form onSubmit={handleSubmit} style={{ maxWidth: 520 }}>
       <h3 style={{ marginTop: 0 }}>Yeni parola</h3>
+      <p style={{ ...styles.muted, fontSize: 13 }}>Konum: {tree.pathText(folderId)}</p>
 
       <label htmlFor="password-title">Başlık</label>
       <input
@@ -1025,7 +1369,11 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
 
   const [itemSearch, setItemSearch] = useState("");
   const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
-  const [mode, setMode] = useState<"view" | "edit" | "create">("view");
+  const [selectedFolderId, setSelectedFolderId] = useState<Id<"folders"> | null>(null);
+  const [openFolders, setOpenFolders] = useState<Set<Id<"folders">>>(new Set());
+  const [mode, setMode] = useState<"view" | "edit" | "create" | "createFolder">("view");
+  const moveItem = useMutation(api.items.move);
+  const [moving, setMoving] = useState(false);
 
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
@@ -1074,6 +1422,9 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
     [data.items, metadataByItemId],
   );
 
+  const tree = useMemo(() => folderTree(data.folders), [data.folders]);
+  const selectedFolder = selectedFolderId ? (tree.byId.get(selectedFolderId) ?? null) : null;
+
   const query = itemSearch.trim().toLocaleLowerCase("tr");
   const listed = items.filter(
     (item) =>
@@ -1084,12 +1435,139 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
 
   const selected = items.find((item) => item.vault.itemId === selectedItemId) ?? null;
 
-  function select(itemId: string) {
-    setSelectedItemId(itemId);
-    setMode("view");
+  // Kayıtların klasörlere göre dağılımı; görünmeyen klasördekiler köke düşer.
+  const itemsByFolder = useMemo(() => {
+    const map = new Map<Id<"folders"> | null, PasswordItem[]>();
+    for (const item of items) {
+      const folderId = item.vault.folderId && tree.byId.has(item.vault.folderId) ? item.vault.folderId : null;
+      map.set(folderId, [...(map.get(folderId) ?? []), item]);
+    }
+    return map;
+  }, [items, tree]);
+
+  const countInside = (id: Id<"folders">): number =>
+    (itemsByFolder.get(id)?.length ?? 0) +
+    tree.childrenOf(id).reduce((sum, child) => sum + countInside(child.id), 0);
+
+  // Yeni kayıt ya da klasörün konumu: seçili klasör ya da seçili kaydın
+  // klasörü (yönetilebiliyorsa), yoksa kök.
+  const contextFolderId = selectedFolder?.id ?? selected?.vault.folderId ?? null;
+  const targetFolderId =
+    contextFolderId && tree.byId.get(contextFolderId)?.canManage ? contextFolderId : null;
+
+  function clearMessages() {
     setError("");
     setSuccess("");
   }
+
+  function select(itemId: string) {
+    setSelectedItemId(itemId);
+    setSelectedFolderId(null);
+    setMode("view");
+    clearMessages();
+  }
+
+  function selectFolder(id: Id<"folders">) {
+    setSelectedFolderId(id);
+    setSelectedItemId(null);
+    setMode("view");
+    clearMessages();
+  }
+
+  const toggleFolder = (id: Id<"folders">) =>
+    setOpenFolders((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
+  // Seçilen kaydın/klasörün yolundaki klasörler açık tutulur.
+  useEffect(() => {
+    if (!contextFolderId) return;
+    const chain = tree.path(contextFolderId).map((folder) => folder.id);
+    setOpenFolders((current) =>
+      chain.every((id) => current.has(id)) ? current : new Set([...current, ...chain]),
+    );
+  }, [contextFolderId, tree]);
+
+  function handleMove(item: PasswordItem, folderId: Id<"folders"> | null) {
+    if (!item.vault.id || moving) return;
+    setMoving(true);
+    clearMessages();
+    moveItem({ id: item.vault.id, folderId })
+      .then(() => setSuccess(`Parola "${tree.pathText(folderId)}" konumuna taşındı.`))
+      .catch((err: unknown) => setError(errorMessage(err)))
+      .finally(() => setMoving(false));
+  }
+
+  const itemRow = (item: PasswordItem, depth: number, showPath = false) => (
+    <button
+      key={item.vault.itemId}
+      type="button"
+      className={`pm-row${item.vault.itemId === selectedItemId ? " selected" : ""}`}
+      style={{ paddingLeft: 10 + depth * 18 + (depth > 0 ? 18 : 0) }}
+      onClick={() => select(item.vault.itemId)}
+    >
+      <span style={{ color: item.vault.isOwner ? "#f59e0b" : "#a78bfa", display: "inline-flex" }}>
+        <Icon size={15}>{icons.key}</Icon>
+      </span>
+      <span style={{ minWidth: 0, flex: 1 }}>
+        <span style={ellipsis}>{item.title}</span>
+        {(showPath || item.username) && (
+          <span style={{ ...ellipsis, ...styles.muted, fontSize: 11 }}>
+            {showPath ? tree.pathText(item.vault.folderId) : item.username}
+          </span>
+        )}
+      </span>
+      {item.vault.pendingSync && (
+        <span
+          title="Sunucuya gönderilmeyi bekliyor"
+          style={{ width: 7, height: 7, borderRadius: "50%", background: "#fbbf24" }}
+        />
+      )}
+    </button>
+  );
+
+  const renderLevel = (parentId: Id<"folders"> | null, depth: number): React.ReactNode[] => [
+    ...tree.childrenOf(parentId).map((folder) => {
+      const open = openFolders.has(folder.id);
+      const count = countInside(folder.id);
+
+      return (
+        <div key={folder.id}>
+          <div
+            className={`pm-row${folder.id === selectedFolderId ? " selected" : ""}`}
+            style={{ paddingLeft: 6 + depth * 18 }}
+            role="button"
+            tabIndex={0}
+            onClick={() => selectFolder(folder.id)}
+            onDoubleClick={() => toggleFolder(folder.id)}
+            onKeyDown={(event) => {
+              if (event.key === "Enter") selectFolder(folder.id);
+            }}
+          >
+            <span
+              onClick={(event) => {
+                event.stopPropagation();
+                toggleFolder(folder.id);
+              }}
+              style={{ display: "inline-flex" }}
+            >
+              <Chevron open={open} onToggle={() => undefined} label={`${folder.name} klasörünü aç`} />
+            </span>
+            <span style={{ color: "#f59e0b", display: "inline-flex" }}>
+              <Icon size={15}>{icons.folder}</Icon>
+            </span>
+            <span style={{ ...ellipsis, flex: 1 }}>{folder.name}</span>
+            <span style={{ ...styles.muted, fontSize: 11 }}>{count}</span>
+          </div>
+          {open && renderLevel(folder.id, depth + 1)}
+        </div>
+      );
+    }),
+    ...(itemsByFolder.get(parentId) ?? []).map((item) => itemRow(item, depth)),
+  ];
 
   async function handleCopyPassword(item: PasswordItem) {
     if (copying) return;
@@ -1168,21 +1646,36 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
               {items.length}
             </span>
           </span>
-          <button
-            type="button"
-            className="pm-icon-button"
-            title="Yeni parola"
-            aria-label="Yeni parola"
-            onClick={() => {
-              setMode("create");
-              setSelectedItemId(null);
-              setError("");
-              setSuccess("");
-            }}
-            disabled={!data.loaded}
-          >
-            <Icon>{icons.plus}</Icon>
-          </button>
+          <div style={{ display: "flex", gap: 2 }}>
+            <button
+              type="button"
+              className="pm-icon-button"
+              title={`Yeni parola (${tree.pathText(targetFolderId)})`}
+              aria-label="Yeni parola"
+              onClick={() => {
+                setMode("create");
+                clearMessages();
+              }}
+              disabled={!data.loaded}
+            >
+              <Icon>{icons.keyPlus}</Icon>
+            </button>
+            <button
+              type="button"
+              className="pm-icon-button"
+              title={
+                isOnline ? `Yeni klasör (${tree.pathText(targetFolderId)})` : "Klasör işlemleri için bağlantı gerekli"
+              }
+              aria-label="Yeni klasör"
+              onClick={() => {
+                setMode("createFolder");
+                clearMessages();
+              }}
+              disabled={!data.loaded || !isOnline}
+            >
+              <Icon>{icons.folderPlus}</Icon>
+            </button>
+          </div>
         </div>
 
         <div style={{ padding: "8px 8px 0" }}>
@@ -1198,40 +1691,20 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
         <div className="pm-panel-body">
           {!data.loaded ? (
             <p style={{ ...styles.muted, fontSize: 13, padding: 6 }}>Parolalar yükleniyor...</p>
-          ) : listed.length === 0 ? (
+          ) : query ? (
+            listed.length === 0 ? (
+              <p style={{ ...styles.muted, fontSize: 13, padding: 6 }}>Eşleşen parola yok.</p>
+            ) : (
+              listed.map((item) => itemRow(item, 0, true))
+            )
+          ) : items.length === 0 && data.folders.length === 0 ? (
             <p style={{ ...styles.muted, fontSize: 13, padding: 6 }}>
-              {query
-                ? "Eşleşen parola yok."
-                : isOnline || data.syncedAt !== null
-                  ? "Henüz parola yok. Eklemek için + düğmesine bas."
-                  : "Bu cihazda henüz eşitlenmiş parola yok."}
+              {isOnline || data.syncedAt !== null
+                ? "Henüz parola yok. Eklemek için yukarıdaki düğmeyi kullan."
+                : "Bu cihazda henüz eşitlenmiş parola yok."}
             </p>
           ) : (
-            listed.map((item) => (
-              <button
-                key={item.vault.itemId}
-                type="button"
-                className={`pm-row${item.vault.itemId === selectedItemId ? " selected" : ""}`}
-                onClick={() => select(item.vault.itemId)}
-              >
-                <span style={{ color: item.vault.isOwner ? "#f59e0b" : "#a78bfa", display: "inline-flex" }}>
-                  <Icon size={15}>{icons.key}</Icon>
-                </span>
-                <span style={{ minWidth: 0, flex: 1 }}>
-                  <span style={{ display: "block", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                    {item.title}
-                  </span>
-                  {item.username && (
-                    <span style={{ display: "block", ...styles.muted, fontSize: 11, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      {item.username}
-                    </span>
-                  )}
-                </span>
-                {item.vault.pendingSync && (
-                  <span title="Sunucuya gönderilmeyi bekliyor" style={{ width: 7, height: 7, borderRadius: "50%", background: "#fbbf24" }} />
-                )}
-              </button>
-            ))
+            renderLevel(null, 0)
           )}
         </div>
       </section>
@@ -1239,7 +1712,15 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
       {/* Orta: seçili parolanın detayı ve geçmişi */}
       <section className="pm-panel" aria-label="Parola detayı">
         <div className="pm-panel-header">
-          <span>{mode === "create" ? "Yeni parola" : (selected?.title ?? "Detay")}</span>
+          <span style={ellipsis}>
+            {mode === "create"
+              ? "Yeni parola"
+              : mode === "createFolder"
+                ? "Yeni klasör"
+                : selectedFolder
+                  ? selectedFolder.name
+                  : (selected?.title ?? "Detay")}
+          </span>
           {selected && mode === "view" && (
             <div style={{ display: "flex", gap: 6 }}>
               <button
@@ -1272,12 +1753,39 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
             <NewItemForm
               data={data}
               isOnline={isOnline}
+              folderId={targetFolderId}
+              tree={tree}
               onCreated={(itemId, message) => {
                 setSelectedItemId(itemId);
+                setSelectedFolderId(null);
                 setMode("view");
                 setSuccess(message);
               }}
               onCancel={() => setMode("view")}
+            />
+          ) : mode === "createFolder" ? (
+            <NewFolderForm
+              parentId={targetFolderId}
+              tree={tree}
+              onCreated={(id, name) => {
+                setSelectedFolderId(id);
+                setSelectedItemId(null);
+                setMode("view");
+                setSuccess(`"${name}" klasörü oluşturuldu.`);
+              }}
+              onCancel={() => setMode("view")}
+            />
+          ) : selectedFolder ? (
+            <FolderDetail
+              folder={selectedFolder}
+              tree={tree}
+              itemCount={itemsByFolder.get(selectedFolder.id)?.length ?? 0}
+              isOnline={isOnline}
+              onMessage={(message) => {
+                setError("");
+                setSuccess(message);
+              }}
+              onDeleted={() => setSelectedFolderId(null)}
             />
           ) : !selected ? (
             <div className="pm-empty" style={{ minHeight: 240 }}>
@@ -1302,7 +1810,7 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
             />
           ) : (
             <div>
-              <dl style={{ display: "grid", gridTemplateColumns: "max-content 1fr", gap: "8px 18px", margin: "0 0 24px", fontSize: 14 }}>
+              <dl style={detailGrid}>
                 <dt style={styles.muted}>Başlık</dt>
                 <dd style={{ margin: 0 }}>{selected.title}</dd>
                 <dt style={styles.muted}>Kullanıcı adı</dt>
@@ -1311,6 +1819,20 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
                 <dd style={{ margin: 0, letterSpacing: 2 }}>••••••••</dd>
                 <dt style={styles.muted}>Sahip</dt>
                 <dd style={{ margin: 0 }}>{selected.vault.isOwner ? "Sen" : "Seninle paylaşılmış"}</dd>
+                <dt style={{ ...styles.muted, alignSelf: "center" }}>Klasör</dt>
+                <dd style={{ margin: 0 }}>
+                  {selected.vault.isOwner && isOnline && selected.vault.id !== null ? (
+                    <FolderSelect
+                      tree={tree}
+                      value={selected.vault.folderId && tree.byId.has(selected.vault.folderId) ? selected.vault.folderId : null}
+                      disabled={moving}
+                      label="Parolanın klasörü"
+                      onChange={(folderId) => handleMove(selected, folderId)}
+                    />
+                  ) : (
+                    tree.pathText(selected.vault.folderId)
+                  )}
+                </dd>
                 {selected.vault.pendingSync && (
                   <>
                     <dt style={styles.muted}>Durum</dt>
@@ -1340,7 +1862,18 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
       </section>
 
       {/* Sağ: yetkilendirme (departmanlar ve kullanıcılar) */}
-      <AuthorizationColumn item={selected?.vault ?? null} data={data} isOnline={isOnline} />
+      <AuthorizationColumn
+        item={selectedFolder ? null : (selected?.vault ?? null)}
+        data={data}
+        isOnline={isOnline}
+      />
     </div>
   );
 }
+
+const ellipsis: React.CSSProperties = {
+  display: "block",
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+  whiteSpace: "nowrap",
+};

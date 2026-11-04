@@ -211,6 +211,24 @@ Böylece daha önce erişimi kaldırılmış birinin elinde kalan eski DEK, yeni
 parolayı açamaz. Sunucu düzenlemeyi yalnızca güncel `keyVersion` ile ve
 eksiksiz alıcı listesiyle kabul eder.
 
+## Klasörler
+
+Parolalar klasörlerde düzenlenir (`folders` tablosu). Her klasörün
+`parentId`'si üst klasörünü gösterir; yoksa kök klasördür. Kaydın
+`folderId`'si yoksa kayıt kökte durur. Klasörler en fazla 20 seviye iç içe
+olabilir ve aynı klasör altında aynı adla iki klasör olamaz.
+
+- **Görünürlük:** Kullanıcı kendi oluşturduğu klasörleri ve içinde (alt
+  klasörler dahil) açabildiği bir kayıt bulunan klasörleri görür.
+  Yöneticiler bütün klasörleri görür.
+- **Yönetim:** Klasörü yalnızca sahibi ve yöneticiler yeniden adlandırır,
+  taşır, siler, içine kayıt ya da alt klasör koyar. Kaydı klasörler arasında
+  kaydın sahibi (ya da bir yönetici) taşır.
+- **Silme:** Klasör silinince içindeki kayıtlar ve alt klasörler bir üst
+  klasöre (kök klasörse köke) taşınır; hiçbir kayıt silinmez.
+- Klasör adları sunucuda **şifrelenmeden** saklanır. Klasör yetkileri sonraki
+  adımda eklenecek; şimdilik yetkilendirme kayıt bazındadır.
+
 ## Paylaşım: kişiler ve departmanlar
 
 Bir kayda iki yoldan erişilebilir:

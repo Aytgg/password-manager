@@ -6,6 +6,7 @@ import { mutation, query } from "./_generated/server";
 import {
   assertSealedField,
   assertWrappedKey,
+  canManageFolder,
   currentDepartmentKey,
   deleteItem,
   directRecipients,
@@ -98,6 +99,7 @@ function serialize(
     isOwner: item.ownerId === userId,
     metadata: item.metadata,
     secret: item.secret,
+    folderId: item.folderId ?? null,
     keyVersion: item.keyVersion,
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
@@ -224,6 +226,7 @@ export const create = mutation({
     metadata: sealedField,
     secret: sealedField,
     ownerAccess: wrappedKey,
+    folderId: v.optional(v.id("folders")),
   },
   handler: async (ctx, args) => {
     const user = await requireActiveUser(ctx);
@@ -255,11 +258,26 @@ export const create = mutation({
       throw new ConvexError("Bu kayıt kimliği zaten kullanılıyor.");
     }
 
+    // Çevrimdışı kuyruktan gelen kayıtta klasör bu arada silinmiş olabilir;
+    // o zaman kayıt köke konur.
+    let folderId: Id<"folders"> | undefined;
+
+    if (args.folderId) {
+      const folder = await ctx.db.get(args.folderId);
+
+      if (folder && !canManageFolder(user, folder)) {
+        throw new ConvexError("Bu klasöre kayıt ekleme yetkin yok.");
+      }
+
+      folderId = folder?._id;
+    }
+
     const now = Date.now();
 
     const id = await ctx.db.insert("items", {
       itemId: args.itemId,
       ownerId: user._id,
+      folderId,
       metadata: args.metadata,
       secret: args.secret,
       keyVersion: 1,
@@ -275,6 +293,32 @@ export const create = mutation({
     });
 
     return id;
+  },
+});
+
+/**
+ * Kaydı bir klasöre ya da köke (`folderId: null`) taşır. Kaydın sahibi ya da
+ * bir yönetici yapabilir; hedef klasörü de yönetebiliyor olmalıdır.
+ */
+export const move = mutation({
+  args: { id: v.id("items"), folderId: v.union(v.id("folders"), v.null()) },
+  handler: async (ctx, args) => {
+    const user = await requireActiveUser(ctx);
+    const item = await ctx.db.get(args.id);
+
+    if (!item || (item.ownerId !== user._id && user.role !== "admin")) {
+      throw new ConvexError("Parola bulunamadı ya da taşıma yetkin yok.");
+    }
+
+    if (args.folderId) {
+      const folder = await ctx.db.get(args.folderId);
+
+      if (!folder || !canManageFolder(user, folder)) {
+        throw new ConvexError("Klasör bulunamadı ya da yönetme yetkin yok.");
+      }
+    }
+
+    await ctx.db.patch(item._id, { folderId: args.folderId ?? undefined, updatedAt: Date.now() });
   },
 });
 

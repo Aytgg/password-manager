@@ -254,6 +254,40 @@ export async function reconcileUserAccess(ctx: MutationCtx, userId: Id<"users">)
   }
 }
 
+/** Kullanıcının açabildiği kayıtların kimlikleri: doğrudan paketi olanlar ve
+ * departmanının güncel anahtarıyla açabildikleri. */
+export async function accessibleItemIds(ctx: QueryCtx, user: Doc<"users">) {
+  const ids = new Set(
+    (
+      await ctx.db
+        .query("itemAccess")
+        .withIndex("by_user", (q) => q.eq("userId", user._id))
+        .collect()
+    ).map((row) => row.item),
+  );
+
+  const department = user.departmentId ? await ctx.db.get(user.departmentId) : null;
+
+  if (department && (await currentDepartmentKey(ctx, department, user._id))) {
+    for (const row of await ctx.db
+      .query("itemDepartmentAccess")
+      .withIndex("by_department", (q) => q.eq("department", department._id))
+      .collect()) {
+      if (row.keyVersion === department.keyVersion) {
+        ids.add(row.item);
+      }
+    }
+  }
+
+  return ids;
+}
+
+/** Klasörü yalnızca sahibi ve yöneticiler yönetir (ad, taşıma, silme, içine
+ * kayıt ya da alt klasör koyma). */
+export function canManageFolder(user: Doc<"users">, folder: Doc<"folders">) {
+  return user.role === "admin" || folder.ownerId === user._id;
+}
+
 /** Bir kaydı bütün anahtar paketleri, paylaşım kuralları ve geçmişiyle siler. */
 export async function deleteItem(ctx: MutationCtx, itemId: Id<"items">) {
   for (const table of ["itemAccess", "itemDepartmentAccess", "itemGrants", "itemHistory"] as const) {

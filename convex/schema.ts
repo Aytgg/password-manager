@@ -78,12 +78,27 @@ export default defineSchema({
     ownerId: v.id("users"),
     metadata: sealedField,
     secret: sealedField,
+    // Bulunduğu klasör; yoksa kökte durur.
+    folderId: v.optional(v.id("folders")),
     keyVersion: v.number(),
     needsRekey: v.boolean(),
     createdAt: v.number(),
     updatedAt: v.number(),
   })
     .index("by_item_id", ["itemId"])
+    .index("by_owner", ["ownerId"])
+    .index("by_folder", ["folderId"]),
+
+  // Parolaları düzenlemek için klasör ağacı. `parentId` yoksa kök
+  // klasördür. Klasör adları şifrelenmez.
+  folders: defineTable({
+    name: v.string(),
+    parentId: v.optional(v.id("folders")),
+    ownerId: v.id("users"),
+    createdAt: v.number(),
+    updatedAt: v.number(),
+  })
+    .index("by_parent", ["parentId"])
     .index("by_owner", ["ownerId"]),
 
   // Kaydın önceki halleri (başlık, kullanıcı adı, parola); kaydın güncel

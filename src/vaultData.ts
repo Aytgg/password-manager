@@ -10,6 +10,7 @@ import { errorMessage } from "./errors";
 
 export type ServerItem = FunctionReturnType<typeof api.items.listMine>[number];
 export type ShareDirectory = FunctionReturnType<typeof api.items.shareDirectory>;
+export type Folder = FunctionReturnType<typeof api.folders.list>[number];
 
 type SealedField = { nonce: string; ciphertext: string };
 type WrappedKey = { ephemeralPublicKey: string; nonce: string; ciphertext: string };
@@ -45,7 +46,7 @@ export type GrantTarget =
  * Kayıtlar istemcide üretilen `itemId` ile anılır; böylece henüz
  * gönderilmemiş bir kayıt da yetkilendirilebilir. */
 export type QueuedOp =
-  | { kind: "create"; item: NewItem }
+  | { kind: "create"; item: NewItem; folderId?: Id<"folders"> | null }
   | { kind: "grant"; itemId: string; target: GrantTarget; granted: boolean };
 
 type CacheContent = {
@@ -53,6 +54,8 @@ type CacheContent = {
   syncedAt: number | null;
   items: ServerItem[];
   directory: ShareDirectory | null;
+  /** Eski sürümün önbelleğinde yoktur. */
+  folders?: Folder[];
   queue: QueuedOp[];
 };
 
@@ -61,6 +64,8 @@ export type VaultItem = {
   /** Sunucudaki kimlik; kayıt henüz gönderilmediyse `null`. */
   id: Id<"items"> | null;
   isOwner: boolean;
+  /** Bulunduğu klasör; `null` ise kökte. */
+  folderId: Id<"folders"> | null;
   encrypted: EncryptedItem;
   /** Sahibin kayıtlarında, kuyruktaki değişikliklerle birlikte paylaşım. */
   grants: Grants | null;
@@ -116,6 +121,7 @@ export function useVaultData({ ownerId, isOnline }: { ownerId: string | null; is
   const live = ownerId !== null && isOnline;
   const serverItems = useQuery(api.items.listMine, live ? {} : "skip");
   const serverDirectory = useQuery(api.items.shareDirectory, live ? {} : "skip");
+  const serverFolders = useQuery(api.folders.list, live ? {} : "skip");
 
   const createItem = useMutation(api.items.create);
   const setUserGrant = useMutation(api.items.setUserGrant);
@@ -167,6 +173,12 @@ export function useVaultData({ ownerId, isOnline }: { ownerId: string | null; is
   }, [live, loaded, serverDirectory]);
 
   useEffect(() => {
+    if (loaded && live && serverFolders !== undefined) {
+      setCache((current) => current && { ...current, folders: serverFolders });
+    }
+  }, [live, loaded, serverFolders]);
+
+  useEffect(() => {
     if (!cache) return;
 
     invoke("save_items_cache", { content: cache }).catch((error: unknown) =>
@@ -205,7 +217,10 @@ export function useVaultData({ ownerId, isOnline }: { ownerId: string | null; is
     void (async () => {
       try {
         if (op.kind === "create") {
-          serverIdsRef.current.set(op.item.itemId, await createItem(op.item));
+          serverIdsRef.current.set(
+            op.item.itemId,
+            await createItem({ ...op.item, folderId: op.folderId ?? undefined }),
+          );
           removeFirst();
           return;
         }
@@ -250,6 +265,7 @@ export function useVaultData({ ownerId, isOnline }: { ownerId: string | null; is
         itemId: item.itemId,
         id: item.id,
         isOwner: item.isOwner,
+        folderId: item.folderId ?? null,
         encrypted: toEncryptedItem(item),
         grants: item.grants,
         pendingSync: false,
@@ -262,6 +278,7 @@ export function useVaultData({ ownerId, isOnline }: { ownerId: string | null; is
           itemId: op.item.itemId,
           id: null,
           isOwner: true,
+          folderId: op.folderId ?? null,
           encrypted: {
             itemId: op.item.itemId,
             ownerId,
@@ -288,8 +305,11 @@ export function useVaultData({ ownerId, isOnline }: { ownerId: string | null; is
     return [...result.values()];
   }, [baseItems, ownerId, queue]);
 
-  const addItem = useCallback((item: NewItem) => {
-    setCache((current) => current && { ...current, queue: [...current.queue, { kind: "create", item }] });
+  const addItem = useCallback((item: NewItem, folderId: Id<"folders"> | null = null) => {
+    setCache(
+      (current) =>
+        current && { ...current, queue: [...current.queue, { kind: "create", item, folderId }] },
+    );
   }, []);
 
   const setGrant = useCallback(
@@ -318,6 +338,7 @@ export function useVaultData({ ownerId, isOnline }: { ownerId: string | null; is
     loaded,
     items,
     directory: (live ? serverDirectory : undefined) ?? cache?.directory ?? null,
+    folders: (live ? serverFolders : undefined) ?? cache?.folders ?? [],
     syncedAt: cache?.syncedAt ?? null,
     queue,
     errors: [cacheError, ...syncErrors].filter(Boolean),
