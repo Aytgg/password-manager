@@ -247,44 +247,41 @@ type Directory = NonNullable<VaultData["directory"]>;
 type DirectoryUser = Directory["users"][number];
 
 /**
- * Seçili parolanın yetkilendirme ağacı: departmanlar ve altında üyeleri,
- * ayrıca yöneticiler. Her düğümün altında yetki satırı ("Yetkilendir")
- * vardır; düğümün kutucuğu bu yetkileri özetler. Çevrimdışıyken de
- * değiştirilebilir: değişiklik kuyruğa alınır ve bağlantı gelince
+ * Sağ sütun: üstte departmanlar, altta kullanıcılar. Her satırın altında
+ * yetki satırı ("Yetkilendir") vardır; satırın kutucuğu bu yetkileri
+ * özetler. Yalnızca seçili parolanın sahibi değiştirebilir. Çevrimdışıyken
+ * de değiştirilebilir: değişiklik kuyruğa alınır ve bağlantı gelince
  * gönderilir. Anahtar dağıtımı ve erişim kaldırıldığında yeniden şifreleme
  * arka planda otomatik yapılır.
  */
-function AuthorizationTree({
+function AuthorizationColumn({
   item,
-  directory,
+  data,
   isOnline,
-  search,
-  expanded,
-  setExpanded,
-  onToggle,
 }: {
-  item: VaultItem;
-  directory: Directory;
+  item: VaultItem | null;
+  data: VaultData;
   isOnline: boolean;
-  search: string;
-  expanded: Set<string>;
-  setExpanded: (update: (current: Set<string>) => Set<string>) => void;
-  onToggle: (target: GrantTarget, granted: boolean) => void;
 }) {
+  const [search, setSearch] = useState("");
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+
+  const editable = item !== null && item.isOwner && data.directory !== null;
+
   // Anahtar durumu (erişim açık mı, hazırlanıyor mu) yalnızca sunucudan
   // öğrenilebilir.
-  const live = useQuery(api.items.sharing, isOnline && item.id ? { id: item.id } : "skip");
+  const live = useQuery(
+    api.items.sharing,
+    editable && isOnline && item.id ? { id: item.id } : "skip",
+  );
   const keyStatus = new Map(live?.users.map((user) => [user.userId, user.hasKey]) ?? []);
-  const grants = item.grants ?? { userIds: [], departmentIds: [] };
+  const grants = item?.grants ?? { userIds: [], departmentIds: [] };
+  const directory = data.directory;
 
-  const query = search.trim().toLocaleLowerCase("tr");
-  const matches = (user: DirectoryUser) =>
-    !query ||
-    user.displayName.toLocaleLowerCase("tr").includes(query) ||
-    user.email.toLocaleLowerCase("tr").includes(query);
+  const toggle = (target: GrantTarget, granted: boolean) => {
+    if (item) data.setGrant(item.itemId, target, granted);
+  };
 
-  // Arama varken eşleşen her düğüm açık gösterilir.
-  const isOpen = (key: string) => (query ? true : expanded.has(key));
   const flip = (key: string) =>
     setExpanded((current) => {
       const next = new Set(current);
@@ -293,178 +290,251 @@ function AuthorizationTree({
       return next;
     });
 
-  const admins = directory.users.filter((user) => user.isAdmin === true);
-  const others = directory.users.filter((user) => user.isAdmin !== true);
+  const setAll = (prefix: string, keys: string[], open: boolean) =>
+    setExpanded((current) => {
+      const next = new Set([...current].filter((key) => !key.startsWith(prefix)));
+      if (open) keys.forEach((key) => next.add(key));
+      return next;
+    });
+
+  const message = !item
+    ? "Yetkilendirmek için soldan kendi parolalarından birini seç."
+    : !item.isOwner
+      ? "Bu parola seninle paylaşılmış; yalnızca sahibi yetkilendirebilir."
+      : !directory
+        ? "Kişi ve departman listesi henüz bu cihaza indirilmedi; bir kez çevrimiçi olunca çevrimdışı da yetkilendirme yapabilirsin."
+        : null;
+
+  const departments = directory?.departments ?? [];
+  const users = [...(directory?.users ?? [])].sort(
+    (a, b) =>
+      Number(b.isAdmin === true) - Number(a.isAdmin === true) ||
+      a.displayName.localeCompare(b.displayName, "tr"),
+  );
+
+  const query = search.trim().toLocaleLowerCase("tr");
+  const visibleUsers = users.filter(
+    (user) =>
+      !query ||
+      user.displayName.toLocaleLowerCase("tr").includes(query) ||
+      user.email.toLocaleLowerCase("tr").includes(query) ||
+      (user.departmentName ?? "").toLocaleLowerCase("tr").includes(query),
+  );
 
   function keyColor(user: DirectoryUser, allowed: boolean) {
     const hasKey = keyStatus.get(user.userId);
     if (!allowed) return "#71717a";
-    if (hasKey === undefined || item.pendingSync) return "#a1a1aa";
+    if (hasKey === undefined || item?.pendingSync) return "#a1a1aa";
     return hasKey ? "#4ade80" : "#fbbf24";
   }
 
-  function statusText(user: DirectoryUser, allowed: boolean) {
-    const hasKey = keyStatus.get(user.userId);
-    const parts = [];
-    if (allowed && hasKey === false && !item.pendingSync) parts.push("anahtar hazırlanıyor");
-    if (user.status === "invited") parts.push("henüz kaydolmadı");
-    return parts.join(" · ");
-  }
+  const expandButtons = (prefix: string, keys: string[]) => (
+    <div style={{ display: "flex", gap: 2 }}>
+      <button
+        type="button"
+        className="pm-icon-button"
+        title="Hepsini aç"
+        aria-label="Hepsini aç"
+        disabled={message !== null}
+        onClick={() => setAll(prefix, keys, true)}
+      >
+        <Icon>{icons.expand}</Icon>
+      </button>
+      <button
+        type="button"
+        className="pm-icon-button"
+        title="Hepsini kapat"
+        aria-label="Hepsini kapat"
+        disabled={message !== null}
+        onClick={() => setAll(prefix, keys, false)}
+      >
+        <Icon>{icons.collapse}</Icon>
+      </button>
+    </div>
+  );
 
-  function userNode(user: DirectoryUser, viaDepartment: boolean, depth: number) {
-    const direct = grants.userIds.includes(user.userId);
-    const allowed = direct || viaDepartment;
-    const key = `user:${user.userId}`;
-    const open = expanded.has(key);
-    const status = statusText(user, allowed);
-
-    return (
-      <div key={user.userId} style={{ marginLeft: depth * 22 }}>
-        <div className="pm-tree-row">
-          <Chevron open={open} onToggle={() => flip(key)} label={`${user.displayName} yetkileri`} />
-          <Checkbox
-            state={direct ? true : viaDepartment ? "mixed" : false}
-            label={`${user.displayName} için yetki`}
-            title={!direct && viaDepartment ? "Departman üzerinden yetkili" : undefined}
-            onChange={(granted) => onToggle({ kind: "user", userId: user.userId }, granted)}
-          />
-          <span style={{ color: keyColor(user, allowed), display: "inline-flex" }}>
-            <Icon size={15}>{icons.user}</Icon>
-          </span>
-          <span style={{ minWidth: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-            {user.displayName}
-          </span>
-          {status && <span style={{ ...styles.muted, fontSize: 11, whiteSpace: "nowrap" }}>{status}</span>}
-        </div>
-
-        {open && (
-          <PermissionRow
-            checked={direct}
-            disabled={false}
-            label={`${user.displayName} için Yetkilendir`}
-            onChange={(granted) => onToggle({ kind: "user", userId: user.userId }, granted)}
-          />
-        )}
-      </div>
-    );
-  }
-
-  const departmentNodes = directory.departments
-    .map((department) => {
-      const members = others.filter((user) => user.departmentId === department.id);
-      const visibleMembers = members.filter(matches);
-      const nameMatches = !query || department.name.toLocaleLowerCase("tr").includes(query);
-
-      if (!nameMatches && visibleMembers.length === 0) return null;
-
-      const granted = grants.departmentIds.includes(department.id);
-      const anyMember = members.some((user) => grants.userIds.includes(user.userId));
-      const key = `department:${department.id}`;
-      const open = isOpen(key);
-
-      return (
-        <div key={department.id}>
-          <div className="pm-tree-row">
-            <Chevron open={open} onToggle={() => flip(key)} label={`${department.name} departmanı`} />
-            <Checkbox
-              state={granted ? true : anyMember ? "mixed" : false}
-              label={`${department.name} departmanı için yetki`}
-              onChange={(value) =>
-                onToggle({ kind: "department", departmentId: department.id }, value)
-              }
-            />
-            <span style={{ color: granted ? "#4ade80" : "#a78bfa", display: "inline-flex" }}>
-              <Icon size={15}>{icons.users}</Icon>
-            </span>
-            <span>{department.name}</span>
-            <span style={{ ...styles.muted, fontSize: 11 }}>{members.length}</span>
-          </div>
-
-          {open && (
-            <>
-              <PermissionRow
-                checked={granted}
-                disabled={false}
-                label={`${department.name} departmanı için Yetkilendir`}
-                title="Departmana sonradan katılanları da kapsar"
-                onChange={(value) =>
-                  onToggle({ kind: "department", departmentId: department.id }, value)
-                }
-              />
-              {(nameMatches && !query ? members : visibleMembers).map((user) =>
-                userNode(user, granted, 1),
-              )}
-            </>
-          )}
-        </div>
-      );
-    })
-    .filter(Boolean);
-
-  const visibleAdmins = admins.filter(matches);
-  const adminsOpen = isOpen("admins");
+  const placeholder = (text: string) => (
+    <p style={{ ...styles.muted, fontSize: 13, padding: 6, margin: 0 }}>{text}</p>
+  );
 
   return (
-    <div>
-      {item.pendingSync && (
-        <p role="status" style={{ ...styles.muted, fontSize: 12, color: "#fbbf24", margin: "4px 6px 8px" }}>
-          {isOnline
-            ? "Değişiklikler sunucuya gönderiliyor..."
-            : "Çevrimdışısın; değişiklikler bağlantı gelince uygulanacak."}
-        </p>
-      )}
-
-      {departmentNodes}
-
-      {visibleAdmins.length > 0 && (
-        <div>
-          <div className="pm-tree-row">
-            <Chevron open={adminsOpen} onToggle={() => flip("admins")} label="Yöneticiler" />
-            <Checkbox
-              state={true}
-              disabled
-              label="Yöneticiler için yetki"
-              title="Yöneticiler bütün parolalara erişir"
-            />
-            <span style={{ color: "#4ade80", display: "inline-flex" }}>
-              <Icon size={15}>{icons.shield}</Icon>
-            </span>
-            <span>Yöneticiler</span>
-            <span style={{ ...styles.muted, fontSize: 11 }}>{admins.length}</span>
-          </div>
-
-          {adminsOpen &&
-            visibleAdmins.map((user) => (
-              <div key={user.userId} className="pm-tree-row" style={{ marginLeft: 22 }}>
-                <span style={{ width: 18 }} />
-                <Checkbox
-                  state={true}
-                  disabled
-                  label={`${user.displayName} için yetki`}
-                  title="Yöneticiler bütün parolalara erişir"
-                />
-                <span style={{ color: keyColor(user, true), display: "inline-flex" }}>
-                  <Icon size={15}>{icons.user}</Icon>
-                </span>
-                <span>{user.displayName}</span>
-                {statusText(user, true) && (
-                  <span style={{ ...styles.muted, fontSize: 11 }}>{statusText(user, true)}</span>
-                )}
-              </div>
-            ))}
+    <div className="pm-side">
+      <section className="pm-panel" aria-label="Departmanlar">
+        <div className="pm-panel-header">
+          <span>Departmanlar</span>
+          {expandButtons(
+            "department:",
+            departments.map((department) => `department:${department.id}`),
+          )}
         </div>
-      )}
 
-      {departmentNodes.length === 0 && visibleAdmins.length === 0 && (
-        <p style={{ ...styles.muted, fontSize: 13, padding: "8px 6px" }}>
-          {query ? "Eşleşen kullanıcı yok." : "Henüz departman ya da kullanıcı yok."}
-        </p>
-      )}
+        <div className="pm-panel-body">
+          {message
+            ? placeholder(message)
+            : departments.length === 0
+              ? placeholder("Henüz departman yok.")
+              : departments.map((department) => {
+                  const granted = grants.departmentIds.includes(department.id);
+                  const members = users.filter(
+                    (user) => user.isAdmin !== true && user.departmentId === department.id,
+                  );
+                  const anyMember = members.some((user) => grants.userIds.includes(user.userId));
+                  const key = `department:${department.id}`;
+                  const open = expanded.has(key);
 
-      <p style={{ ...styles.muted, fontSize: 12, padding: "12px 6px 0", lineHeight: 1.5 }}>
-        Erişim kaldırıldığında parola yeni bir anahtarla yeniden şifrelenir. Kaldırılan kişi
-        parolayı daha önce görmüş olabilir; gerekirse parolanın kendisini değiştir.
-      </p>
+                  return (
+                    <div key={department.id}>
+                      <div className="pm-tree-row">
+                        <Chevron
+                          open={open}
+                          onToggle={() => flip(key)}
+                          label={`${department.name} yetkileri`}
+                        />
+                        <Checkbox
+                          state={granted ? true : anyMember ? "mixed" : false}
+                          label={`${department.name} departmanı için yetki`}
+                          title={
+                            !granted && anyMember ? "Bazı üyelerine kişisel yetki verilmiş" : undefined
+                          }
+                          onChange={(value) =>
+                            toggle({ kind: "department", departmentId: department.id }, value)
+                          }
+                        />
+                        <span
+                          style={{ color: granted ? "#4ade80" : "#a78bfa", display: "inline-flex" }}
+                        >
+                          <Icon size={15}>{icons.users}</Icon>
+                        </span>
+                        <span>{department.name}</span>
+                        <span style={{ ...styles.muted, fontSize: 11 }}>
+                          {members.length} kullanıcı
+                        </span>
+                      </div>
+
+                      {open && (
+                        <PermissionRow
+                          checked={granted}
+                          disabled={false}
+                          label={`${department.name} departmanı için Yetkilendir`}
+                          title="Departmana sonradan katılanları da kapsar"
+                          onChange={(value) =>
+                            toggle({ kind: "department", departmentId: department.id }, value)
+                          }
+                        />
+                      )}
+                    </div>
+                  );
+                })}
+        </div>
+      </section>
+
+      <section className="pm-panel" aria-label="Kullanıcılar">
+        <div className="pm-panel-header">
+          <span>Kullanıcılar</span>
+          {expandButtons(
+            "user:",
+            users.filter((user) => user.isAdmin !== true).map((user) => `user:${user.userId}`),
+          )}
+        </div>
+
+        <div style={{ padding: "8px 8px 0" }}>
+          <input
+            className="pm-search"
+            value={search}
+            onChange={(event) => setSearch(event.target.value)}
+            placeholder="Kullanıcı ara..."
+            aria-label="Kullanıcı ara"
+            disabled={message !== null}
+          />
+        </div>
+
+        <div className="pm-panel-body">
+          {message
+            ? placeholder(message)
+            : visibleUsers.length === 0
+              ? placeholder(query ? "Eşleşen kullanıcı yok." : "Başka kullanıcı yok.")
+              : visibleUsers.map((user) => {
+                  const isAdmin = user.isAdmin === true;
+                  const direct = grants.userIds.includes(user.userId);
+                  const viaDepartment =
+                    user.departmentId !== null && grants.departmentIds.includes(user.departmentId);
+                  const allowed = isAdmin || direct || viaDepartment;
+                  const key = `user:${user.userId}`;
+                  const open = !isAdmin && expanded.has(key);
+
+                  const description = [
+                    isAdmin ? "Yönetici" : user.departmentName,
+                    user.status === "invited" ? "henüz kaydolmadı" : null,
+                    allowed && keyStatus.get(user.userId) === false && !item?.pendingSync
+                      ? "anahtar hazırlanıyor"
+                      : null,
+                  ]
+                    .filter(Boolean)
+                    .join(" · ");
+
+                  return (
+                    <div key={user.userId}>
+                      <div className="pm-tree-row">
+                        {isAdmin ? (
+                          <span style={{ width: 18, flexShrink: 0 }} />
+                        ) : (
+                          <Chevron
+                            open={open}
+                            onToggle={() => flip(key)}
+                            label={`${user.displayName} yetkileri`}
+                          />
+                        )}
+                        <Checkbox
+                          state={isAdmin || direct ? true : viaDepartment ? "mixed" : false}
+                          disabled={isAdmin}
+                          label={`${user.displayName} için yetki`}
+                          title={
+                            isAdmin
+                              ? "Yöneticiler bütün parolalara erişir"
+                              : !direct && viaDepartment
+                                ? "Departmanı üzerinden yetkili"
+                                : undefined
+                          }
+                          onChange={(granted) =>
+                            toggle({ kind: "user", userId: user.userId }, granted)
+                          }
+                        />
+                        <span style={{ color: keyColor(user, allowed), display: "inline-flex" }}>
+                          <Icon size={15}>{isAdmin ? icons.shield : icons.user}</Icon>
+                        </span>
+                        <span
+                          style={{
+                            minWidth: 0,
+                            overflow: "hidden",
+                            textOverflow: "ellipsis",
+                            whiteSpace: "nowrap",
+                          }}
+                          title={user.email}
+                        >
+                          {user.displayName}
+                          {description && (
+                            <span style={{ ...styles.muted, fontSize: 11, marginLeft: 8 }}>
+                              {description}
+                            </span>
+                          )}
+                        </span>
+                      </div>
+
+                      {open && (
+                        <PermissionRow
+                          checked={direct}
+                          disabled={false}
+                          label={`${user.displayName} için Yetkilendir`}
+                          onChange={(granted) =>
+                            toggle({ kind: "user", userId: user.userId }, granted)
+                          }
+                        />
+                      )}
+                    </div>
+                  );
+                })}
+        </div>
+      </section>
     </div>
   );
 }
@@ -946,8 +1016,6 @@ function NewItemForm({
   );
 }
 
-type Tab = "personal" | "shared";
-
 export default function PasswordManager({ data, isOnline }: PasswordManagerProps) {
   const pendingSharedCount = useQuery(api.items.pendingSharedCount, isOnline ? {} : "skip");
 
@@ -955,12 +1023,9 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
     Record<string, DecryptedMetadata>
   >({});
 
-  const [tab, setTab] = useState<Tab>("personal");
   const [itemSearch, setItemSearch] = useState("");
-  const [userSearch, setUserSearch] = useState("");
   const [selectedItemId, setSelectedItemId] = useState<string | null>(null);
   const [mode, setMode] = useState<"view" | "edit" | "create">("view");
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
   const [error, setError] = useState("");
   const [success, setSuccess] = useState("");
@@ -1009,14 +1074,12 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
     [data.items, metadataByItemId],
   );
 
-  const personalCount = items.filter((item) => item.vault.isOwner).length;
   const query = itemSearch.trim().toLocaleLowerCase("tr");
   const listed = items.filter(
     (item) =>
-      item.vault.isOwner === (tab === "personal") &&
-      (!query ||
-        item.title.toLocaleLowerCase("tr").includes(query) ||
-        (item.username ?? "").toLocaleLowerCase("tr").includes(query)),
+      !query ||
+      item.title.toLocaleLowerCase("tr").includes(query) ||
+      (item.username ?? "").toLocaleLowerCase("tr").includes(query),
   );
 
   const selected = items.find((item) => item.vault.itemId === selectedItemId) ?? null;
@@ -1044,12 +1107,6 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
       setCopying(false);
     }
   }
-
-  const allTreeKeys = [
-    ...(data.directory?.departments.map((department) => `department:${department.id}`) ?? []),
-    ...(data.directory?.users.map((user) => `user:${user.userId}`) ?? []),
-    "admins",
-  ];
 
   const banners = (
     <>
@@ -1104,30 +1161,13 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
     <div className="pm-layout">
       {/* Sol: parola listesi */}
       <section className="pm-panel" aria-label="Parolalar">
-        <div className="pm-tabs" role="tablist">
-          {(
-            [
-              ["shared", "Paylaşılanlar", icons.users, items.length - personalCount],
-              ["personal", "Kişisel", icons.user, personalCount],
-            ] as const
-          ).map(([value, label, icon, count]) => (
-            <button
-              key={value}
-              type="button"
-              role="tab"
-              aria-selected={tab === value}
-              className={`pm-tab${tab === value ? " active" : ""}`}
-              onClick={() => setTab(value)}
-            >
-              <Icon size={15}>{icon}</Icon>
-              {label}
-              <span style={{ ...styles.muted, fontSize: 11 }}>{count}</span>
-            </button>
-          ))}
-        </div>
-
         <div className="pm-panel-header">
-          <span>Parolalar</span>
+          <span>
+            Parolalar
+            <span style={{ ...styles.muted, fontSize: 11, marginLeft: 8, fontWeight: 400 }}>
+              {items.length}
+            </span>
+          </span>
           <button
             type="button"
             className="pm-icon-button"
@@ -1162,11 +1202,9 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
             <p style={{ ...styles.muted, fontSize: 13, padding: 6 }}>
               {query
                 ? "Eşleşen parola yok."
-                : tab === "personal"
-                  ? "Henüz kendi parolan yok. Eklemek için + düğmesine bas."
-                  : isOnline || data.syncedAt !== null
-                    ? "Seninle paylaşılmış parola yok."
-                    : "Bu cihazda henüz eşitlenmiş parola yok."}
+                : isOnline || data.syncedAt !== null
+                  ? "Henüz parola yok. Eklemek için + düğmesine bas."
+                  : "Bu cihazda henüz eşitlenmiş parola yok."}
             </p>
           ) : (
             listed.map((item) => (
@@ -1235,7 +1273,6 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
               data={data}
               isOnline={isOnline}
               onCreated={(itemId, message) => {
-                setTab("personal");
                 setSelectedItemId(itemId);
                 setMode("view");
                 setSuccess(message);
@@ -1302,69 +1339,8 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
         </div>
       </section>
 
-      {/* Sağ: yetkilendirme */}
-      <section className="pm-panel" aria-label="Kullanıcılar ve departmanlar">
-        <div className="pm-panel-header">
-          <span>Kullanıcılar ve Departmanlar</span>
-          <div style={{ display: "flex", gap: 2 }}>
-            <button
-              type="button"
-              className="pm-icon-button"
-              title="Hepsini aç"
-              aria-label="Hepsini aç"
-              onClick={() => setExpanded(new Set(allTreeKeys))}
-            >
-              <Icon>{icons.expand}</Icon>
-            </button>
-            <button
-              type="button"
-              className="pm-icon-button"
-              title="Hepsini kapat"
-              aria-label="Hepsini kapat"
-              onClick={() => setExpanded(new Set())}
-            >
-              <Icon>{icons.collapse}</Icon>
-            </button>
-          </div>
-        </div>
-
-        <div style={{ padding: "8px 8px 0" }}>
-          <input
-            className="pm-search"
-            value={userSearch}
-            onChange={(event) => setUserSearch(event.target.value)}
-            placeholder="Kullanıcı ara..."
-            aria-label="Kullanıcı ara"
-          />
-        </div>
-
-        <div className="pm-panel-body">
-          {!selected ? (
-            <p style={{ ...styles.muted, fontSize: 13, padding: 6 }}>
-              Yetkilendirmek için soldan kendi parolalarından birini seç.
-            </p>
-          ) : !selected.vault.isOwner ? (
-            <p style={{ ...styles.muted, fontSize: 13, padding: 6 }}>
-              Bu parola seninle paylaşılmış; yalnızca sahibi yetkilendirebilir.
-            </p>
-          ) : !data.directory ? (
-            <p style={{ ...styles.muted, fontSize: 13, padding: 6 }}>
-              Kişi ve departman listesi henüz bu cihaza indirilmedi; bir kez çevrimiçi olunca
-              çevrimdışı da yetkilendirme yapabilirsin.
-            </p>
-          ) : (
-            <AuthorizationTree
-              item={selected.vault}
-              directory={data.directory}
-              isOnline={isOnline}
-              search={userSearch}
-              expanded={expanded}
-              setExpanded={setExpanded}
-              onToggle={(target, granted) => data.setGrant(selected.vault.itemId, target, granted)}
-            />
-          )}
-        </div>
-      </section>
+      {/* Sağ: yetkilendirme (departmanlar ve kullanıcılar) */}
+      <AuthorizationColumn item={selected?.vault ?? null} data={data} isOnline={isOnline} />
     </div>
   );
 }
