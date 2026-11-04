@@ -354,23 +354,19 @@ function describeChange(entry: HistoryInfo) {
  * eski parolalar gösterilmez.
  */
 function PasswordHistoryPanel({ id }: { id: Id<"items"> }) {
-  const convex = useConvex();
+  const server = useQuery(api.items.history, { id });
   const [entries, setEntries] = useState<HistoryInfo[] | null>(null);
   const [error, setError] = useState("");
 
-  // useQuery yerine tek seferlik sorgu: sunucu hatası (erişim yok, eski
-  // deployment) bütün ekranı çökertmeden panelde gösterilir.
   useEffect(() => {
+    if (!server) return;
+
     let cancelled = false;
 
-    convex
-      .query(api.items.history, { id })
-      .then((server) =>
-        invoke<HistoryInfo[]>("item_password_history", {
-          item: toEncryptedItem(server.item),
-          history: server.history,
-        }),
-      )
+    invoke<HistoryInfo[]>("item_password_history", {
+      item: toEncryptedItem(server.item),
+      history: server.history,
+    })
       .then((result) => {
         if (!cancelled) {
           setEntries(result);
@@ -384,7 +380,7 @@ function PasswordHistoryPanel({ id }: { id: Id<"items"> }) {
     return () => {
       cancelled = true;
     };
-  }, [convex, id]);
+  }, [server]);
 
   return (
     <div>
