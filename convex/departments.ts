@@ -4,7 +4,6 @@ import type { MutationCtx } from "./_generated/server";
 import { mutation, query } from "./_generated/server";
 import {
   DEFAULT_DEPARTMENTS,
-  deleteUser,
   reconcileUserAccess,
   removeDisallowedAccess,
   requireActiveUser,
@@ -101,7 +100,9 @@ export const rename = mutation({
 
 /**
  * Departmanı siler. Departmandaki her kullanıcı için ne yapılacağı
- * belirtilmelidir: başka bir departmana taşıma ya da kullanıcıyı silme.
+ * belirtilmelidir: başka bir departmana taşıma ya da devre dışı bırakma.
+ * Devre dışı bırakılan kullanıcının kaydı ve parolaları silinmez; erişimleri
+ * kaldırılır, departmanı boşalır (yeniden etkinleştirirken seçilir).
  * Departmanla yapılan paylaşımlar kalkar; o kayıtlar yeniden şifrelenir.
  */
 export const remove = mutation({
@@ -114,7 +115,7 @@ export const remove = mutation({
           action: v.literal("move"),
           departmentId: v.id("departments"),
         }),
-        v.object({ userId: v.id("users"), action: v.literal("delete") }),
+        v.object({ userId: v.id("users"), action: v.literal("disable") }),
       ),
     ),
   },
@@ -142,9 +143,11 @@ export const remove = mutation({
     }
 
     for (const assignment of args.assignments) {
-      if (assignment.action === "delete") {
+      if (assignment.action === "disable") {
         if (assignment.userId === actor._id) {
-          throw new ConvexError("Kendi hesabını silemezsin; kendini başka bir departmana taşı.");
+          throw new ConvexError(
+            "Kendi hesabını devre dışı bırakamazsın; kendini başka bir departmana taşı.",
+          );
         }
         continue;
       }
@@ -155,15 +158,13 @@ export const remove = mutation({
     }
 
     for (const assignment of args.assignments) {
-      if (assignment.action === "delete") {
-        await deleteUser(ctx, assignment.userId);
-      } else {
-        await ctx.db.patch(assignment.userId, {
-          departmentId: assignment.departmentId,
-          updatedAt: Date.now(),
-        });
-        await reconcileUserAccess(ctx, assignment.userId);
-      }
+      await ctx.db.patch(
+        assignment.userId,
+        assignment.action === "disable"
+          ? { status: "disabled", departmentId: undefined, updatedAt: Date.now() }
+          : { departmentId: assignment.departmentId, updatedAt: Date.now() },
+      );
+      await reconcileUserAccess(ctx, assignment.userId);
     }
 
     // Departmanla yapılan paylaşımlar kalkar; departman üyeleri DEK'leri

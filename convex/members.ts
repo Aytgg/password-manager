@@ -179,19 +179,6 @@ export const list = query({
       (await ctx.db.query("departments").collect()).map((d) => [d._id, d.name]),
     );
 
-    const ownedItems = new Map<Id<"users">, number>();
-    for (const user of users) {
-      ownedItems.set(
-        user._id,
-        (
-          await ctx.db
-            .query("items")
-            .withIndex("by_owner", (q) => q.eq("ownerId", user._id))
-            .collect()
-        ).length,
-      );
-    }
-
     return users
       .map((user) => ({
         id: user._id,
@@ -206,7 +193,6 @@ export const list = query({
         hasPublicKey: user.publicKey !== undefined,
         inviteExpiresAt: user.status === "invited" ? (user.inviteExpiresAt ?? null) : null,
         isSelf: user._id === actor._id,
-        ownedItemCount: ownedItems.get(user._id) ?? 0,
         canManage: canManageUser(actor, user),
       }))
       .sort((a, b) => a.email.localeCompare(b.email, "tr"));

@@ -87,14 +87,8 @@ const styles: Record<string, React.CSSProperties> = {
 type Department = FunctionReturnType<typeof api.departments.list>[number];
 type Member = FunctionReturnType<typeof api.members.list>[number];
 
-/** Departmandaki bir kullanıcı için seçilen işlem: `move:<departmanId>` ya da `delete`. */
+/** Departmandaki bir kullanıcı için seçilen işlem: `move:<departmanId>` ya da `disable`. */
 type Choice = string;
-
-function choiceLabel(member: Member) {
-  return member.ownedItemCount > 0
-    ? `Kullanıcıyı sil (kendi ${member.ownedItemCount} parolası da silinir)`
-    : "Kullanıcıyı sil";
-}
 
 /**
  * Departman silme: departmandaki her kullanıcı için başka bir departmana
@@ -116,7 +110,7 @@ function DeleteDepartmentPanel({
   onConfirm: (
     assignments: (
       | { userId: Id<"users">; action: "move"; departmentId: Id<"departments"> }
-      | { userId: Id<"users">; action: "delete" }
+      | { userId: Id<"users">; action: "disable" }
     )[],
   ) => void;
 }) {
@@ -132,7 +126,9 @@ function DeleteDepartmentPanel({
         </option>
       ))}
       {(member === null || !member.isSelf) && (
-        <option value="delete">{member ? choiceLabel(member) : "Kullanıcıları sil"}</option>
+        <option value="disable">
+          {member ? "Devre dışı bırak" : "Hepsini devre dışı bırak"}
+        </option>
       )}
     </>
   );
@@ -142,13 +138,13 @@ function DeleteDepartmentPanel({
       Object.fromEntries(
         members.map((member) => [
           member.id,
-          choice === "delete" && member.isSelf ? (choices[member.id] ?? "") : choice,
+          choice === "disable" && member.isSelf ? (choices[member.id] ?? "") : choice,
         ]),
       ),
     );
 
   const complete = members.every((member) => (choices[member.id] ?? "") !== "");
-  const deleting = members.filter((member) => choices[member.id] === "delete");
+  const disabling = members.filter((member) => choices[member.id] === "disable");
 
   return (
     <div
@@ -208,9 +204,11 @@ function DeleteDepartmentPanel({
         </>
       )}
 
-      {deleting.length > 0 && (
-        <p style={{ ...styles.error, fontSize: 13 }}>
-          {deleting.length} kullanıcı ve kendi parolaları kalıcı olarak silinecek.
+      {disabling.length > 0 && (
+        <p style={{ ...styles.muted, color: "#fbbf24" }}>
+          {disabling.length} kullanıcı devre dışı bırakılacak: giriş yapamaz, erişimleri
+          kaldırılır. Kendi parolaları silinmez; yeniden etkinleştirmek için önce bir departman
+          seçilir.
         </p>
       )}
 
@@ -228,8 +226,8 @@ function DeleteDepartmentPanel({
             onConfirm(
               members.map((member) => {
                 const choice = choices[member.id];
-                return choice === "delete"
-                  ? { userId: member.id, action: "delete" as const }
+                return choice === "disable"
+                  ? { userId: member.id, action: "disable" as const }
                   : {
                       userId: member.id,
                       action: "move" as const,
@@ -269,7 +267,7 @@ export default function AdminPanel({ me }: { me: Me }) {
     mode: "rename" | "delete";
     name: string;
   } | null>(null);
-  // "" bütün kullanıcılar, "none" departmansızlar.
+  // "" bütün kullanıcılar, "admins" yöneticiler, aksi halde departman kimliği.
   const [departmentFilter, setDepartmentFilter] = useState("");
   const [inviteEmail, setInviteEmail] = useState("");
   const [inviteRole, setInviteRole] = useState<Role>("member");
@@ -634,7 +632,7 @@ export default function AdminPanel({ me }: { me: Me }) {
                   {department.name}
                 </option>
               ))}
-              <option value="none">Departmanı olmayanlar</option>
+              <option value="admins">Yöneticiler</option>
             </select>
           </div>
         )}
@@ -647,8 +645,8 @@ export default function AdminPanel({ me }: { me: Me }) {
               .filter((member) =>
                 departmentFilter === ""
                   ? true
-                  : departmentFilter === "none"
-                    ? member.departmentId === null
+                  : departmentFilter === "admins"
+                    ? member.role === "admin"
                     : member.departmentId === departmentFilter,
               )
               .map((member) => (
@@ -749,7 +747,21 @@ export default function AdminPanel({ me }: { me: Me }) {
                     <button
                       type="button"
                       style={styles.secondaryButton}
-                      disabled={busy}
+                      // Departmanı silinerek devre dışı kalan kullanıcıya önce
+                      // departman seçilir.
+                      disabled={
+                        busy ||
+                        (member.status === "disabled" &&
+                          member.role !== "admin" &&
+                          member.departmentId === null)
+                      }
+                      title={
+                        member.status === "disabled" &&
+                        member.role !== "admin" &&
+                        member.departmentId === null
+                          ? "Etkinleştirmeden önce bir departman seç"
+                          : undefined
+                      }
                       onClick={() =>
                         void run(
                           () =>

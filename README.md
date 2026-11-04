@@ -249,9 +249,11 @@ dışı bırakılan kişinin paketleri silinir ve kayıtlar yeniden şifrelenir.
 ### Departman silme
 
 Departman silinirken departmandaki her kullanıcı için ya başka bir departmana
-taşıma ya da kullanıcıyı silme seçilir (herkese tek seçimle de uygulanabilir).
-Taşınan kullanıcının eski departman anahtarı kaldırılır. Silinen kullanıcının
-oturumları, giriş hesabı, anahtar paketleri ve **kendi parolaları** silinir.
+taşıma ya da devre dışı bırakma seçilir (herkese tek seçimle de
+uygulanabilir). Taşınan kullanıcının eski departman anahtarı kaldırılır. Devre
+dışı bırakılan kullanıcı silinmez: giriş yapamaz, anahtar paketleri kaldırılır,
+kendi parolaları durur; departmanı boşalır ve yeniden etkinleştirilmeden önce
+bir departman seçilir.
 Departmanla yapılan paylaşımlar kalkar ve o kayıtlar yeniden şifrelenir.
 
 ### Arka plan işleri

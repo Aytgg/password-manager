@@ -1021,7 +1021,7 @@ describe("kullanıcı yönetimi", () => {
     ).rejects.toThrow(/yalnızca yönetici/);
   });
 
-  test("departman silinirken üyeler taşınır ya da silinir, paylaşımlar kalkar", async () => {
+  test("departman silinirken üyeler taşınır ya da devre dışı bırakılır, paylaşımlar kalkar", async () => {
     const {
       t, ids, uid, as, runDepartmentWork, runItemWork, createItem, shareWithDepartment,
       getItem, getDepartment, departmentKeyNames,
@@ -1045,7 +1045,7 @@ describe("kullanıcı yönetimi", () => {
         id: ids.yazilim,
         assignments: [
           { userId: uid("alice"), action: "move", departmentId: ids.yazilim },
-          { userId: uid("bob"), action: "delete" },
+          { userId: uid("bob"), action: "disable" },
         ],
       }),
     ).rejects.toThrow(/geçersiz/);
@@ -1057,25 +1057,21 @@ describe("kullanıcı yönetimi", () => {
       id: ids.yazilim,
       assignments: [
         { userId: uid("alice"), action: "move", departmentId: ids.satis },
-        { userId: uid("bob"), action: "delete" },
+        { userId: uid("bob"), action: "disable" },
       ],
     });
 
     expect(await getDepartment(ids.yazilim)).toBeNull();
     expect(await departmentKeyNames(ids.yazilim)).toEqual([]);
 
-    // Alice Satış'a taşındı; Bob ve kendi kaydı silindi.
+    // Alice Satış'a taşındı; Bob devre dışı, kaydı ve parolası duruyor.
     expect(await t.run((ctx) => ctx.db.get(uid("alice")))).toMatchObject({ departmentId: ids.satis });
-    expect(await t.run((ctx) => ctx.db.get(uid("bob")))).toBeNull();
-    expect(await getItem(bobItem)).toBeNull();
-    expect(
-      await t.run((ctx) =>
-        ctx.db
-          .query("itemAccess")
-          .withIndex("by_user", (q) => q.eq("userId", uid("bob")))
-          .collect(),
-      ),
-    ).toEqual([]);
+    const bob = await t.run((ctx) => ctx.db.get(uid("bob")));
+    expect(bob).toMatchObject({ status: "disabled" });
+    expect(bob!.departmentId).toBeUndefined();
+    expect(await getItem(bobItem)).not.toBeNull();
+    await expect(as("bob").query(api.items.listMine, {})).rejects.toThrow(/erişim yetkisi yok/);
+    expect(await departmentKeyNames(ids.satis)).not.toContain("bob");
 
     // Departmanla paylaşım kalktı ve kayıt yeniden şifrelenecek.
     expect((await as("carol").query(api.items.sharing, { id: carolItem })).departments).toEqual([
