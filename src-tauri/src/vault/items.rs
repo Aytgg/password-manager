@@ -7,9 +7,10 @@
 //! anahtarına ayrı ayrı paketlenir. Sunucu yalnızca şifreli veriyi ve
 //! paketlenmiş anahtarları görür.
 //!
-//! Parola değiştirildiğinde eski parola, aynı DEK ile şifrelenmiş üçüncü bir
-//! alanda (geçmiş) saklanır. Böylece parolayı açabilen herkes geçmişini de
-//! açabilir; her rekey'de geçmiş de yeni DEK'e taşınır.
+//! Kayıt her değiştiğinde (başlık, kullanıcı adı ya da parola) önceki hali
+//! aynı DEK ile şifrelenmiş ayrı bir geçmiş kaydı olarak saklanır. Böylece
+//! kaydı açabilen herkes geçmişini de açabilir; her rekey'de bütün geçmiş
+//! kayıtları da yeni DEK'e taşınır.
 
 use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use rand::RngCore;
@@ -26,11 +27,6 @@ use crate::crypto::{
 const MAX_TITLE_CHARS: usize = 200;
 const MAX_USERNAME_CHARS: usize = 320;
 const MAX_SECRET_BYTES: usize = 4096;
-/// Saklanan en fazla eski parola sayısı; daha eskileri silinir.
-const MAX_HISTORY_ENTRIES: usize = 20;
-/// Geçmişin şifrelenmeden önceki en büyük boyutu (şifreli ve base64'lü hali
-/// sunucunun 16 KB sınırının altında kalır).
-const MAX_HISTORY_BYTES: usize = 10 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -71,9 +67,6 @@ pub struct EncryptedItem {
     pub owner_id: String,
     pub metadata: SealedField,
     pub secret: SealedField,
-    /// Eski parolalar; parola hiç değişmediyse yok.
-    #[serde(default)]
-    pub history: Option<SealedField>,
     pub access: ItemAccess,
 }
 
@@ -121,7 +114,9 @@ pub struct DepartmentAccess {
 pub struct RekeyedItem {
     pub metadata: SealedField,
     pub secret: SealedField,
-    pub history: Option<SealedField>,
+    /// Bütün geçmiş kayıtları yeni DEK ile; mevcutlar kimlikleriyle, bu
+    /// düzenlemeyle eklenen (varsa) kimliksiz.
+    pub history: Vec<HistoryRecord>,
     pub accesses: Vec<RecipientAccess>,
     pub department_accesses: Vec<DepartmentAccess>,
 }
@@ -153,22 +148,39 @@ fn history_aad(owner_id: &str, item_id: &str) -> Vec<u8> {
     format!("password-manager/item/v1/history:{owner_id}:{item_id}").into_bytes()
 }
 
-/// Geçmişteki bir parola: değerin kendisi (base64) ve yerini yeni parolaya
-/// bıraktığı an (Unix ms).
+/// Sunucudaki bir geçmiş kaydı: kaydın önceki hali, DEK ile şifreli.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HistoryRecord {
+    /// Sunucudaki kimlik; yeni eklenen kayıtta yok.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    pub entry: SealedField,
+}
+
+/// Kaydın bir önceki hali. Parola base64 olarak tutulur.
 #[derive(Serialize, Deserialize, Zeroize, ZeroizeOnDrop)]
 #[serde(rename_all = "camelCase")]
 struct HistoryEntry {
+    title: String,
+    username: Option<String>,
     password: String,
     replaced_at: u64,
 }
 
 /// Arayüze dönen geçmiş satırı; parolanın kendisini içermez.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct HistoryInfo {
-    /// `decrypt_history_password` için sıra numarası; 0 en eskisidir.
-    pub index: usize,
+    pub id: String,
+    /// Bu halin yerini yenisine bıraktığı an (Unix ms).
     pub replaced_at: u64,
+    pub title: String,
+    pub username: Option<String>,
+    /// Bir sonraki halde değişenler.
+    pub title_changed: bool,
+    pub username_changed: bool,
+    pub password_changed: bool,
 }
 
 fn now_ms() -> u64 {
@@ -178,38 +190,15 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn open_history(item: &EncryptedItem, dek: &[u8; 32]) -> Result<Vec<HistoryEntry>, String> {
-    let Some(history) = &item.history else {
-        return Ok(Vec::new());
-    };
-
-    let plaintext = open(history, dek, &history_aad(&item.owner_id, &item.item_id))?;
-
-    serde_json::from_slice(&plaintext).map_err(|_| "Parola geçmişi okunamadı.".to_string())
-}
-
-fn seal_history(
-    entries: &[HistoryEntry],
+fn open_history_entry(
+    record: &HistoryRecord,
     dek: &[u8; 32],
     aad: &[u8],
-) -> Result<Option<SealedField>, String> {
-    // Sunucu şifreli alanı 16 KB (base64) ile sınırlar; sığmazsa en eski
-    // parolalar düşülür.
-    let mut entries = entries;
+) -> Result<HistoryEntry, String> {
+    let plaintext = open(&record.entry, dek, aad)
+        .map_err(|_| "Parola geçmişi çözülemedi.".to_string())?;
 
-    loop {
-        if entries.is_empty() {
-            return Ok(None);
-        }
-
-        let json = Zeroizing::new(serde_json::to_vec(entries).map_err(|error| error.to_string())?);
-
-        if json.len() <= MAX_HISTORY_BYTES {
-            return seal(&json, dek, aad).map(Some);
-        }
-
-        entries = &entries[1..];
-    }
+    serde_json::from_slice(&plaintext).map_err(|_| "Parola geçmişi okunamadı.".to_string())
 }
 
 fn decode_fixed<const N: usize>(value: &str, field: &str) -> Result<[u8; N], String> {
@@ -381,39 +370,72 @@ pub fn decrypt_metadata(
         .map_err(|_| "Kaydın meta verisi okunamadı.".to_string())
 }
 
-/// Geçmişteki parolaların zamanları, en yenisi önce. Parolalar çözülmez.
+/// Geçmiş kayıtlarını çözer; en yenisi önce. Parolalar dönmez, yalnızca
+/// her halden sonra neyin değiştiği.
 pub fn history_summary(
     identity: &IdentityKeyPair,
     item: &EncryptedItem,
+    records: &[HistoryRecord],
 ) -> Result<Vec<HistoryInfo>, String> {
-    if item.history.is_none() {
+    if records.is_empty() {
         return Ok(Vec::new());
     }
 
     let dek = unwrap_item_dek(identity, item)?;
+    let aad = history_aad(&item.owner_id, &item.item_id);
 
-    Ok(open_history(item, &dek)?
+    let mut entries = records
         .iter()
-        .enumerate()
-        .rev()
-        .map(|(index, entry)| HistoryInfo {
-            index,
-            replaced_at: entry.replaced_at,
+        .map(|record| {
+            let id = record
+                .id
+                .clone()
+                .ok_or_else(|| "Geçmiş kaydının kimliği eksik.".to_string())?;
+            Ok((id, open_history_entry(record, &dek, &aad)?))
         })
-        .collect())
+        .collect::<Result<Vec<_>, String>>()?;
+    entries.sort_by_key(|(_, entry)| entry.replaced_at);
+
+    let metadata: ItemMetadata = serde_json::from_slice(&open(
+        &item.metadata,
+        &dek,
+        &metadata_aad(&item.owner_id, &item.item_id),
+    )?)
+    .map_err(|_| "Kaydın meta verisi okunamadı.".to_string())?;
+    let secret = open(&item.secret, &dek, &secret_aad(&item.owner_id, &item.item_id))?;
+    let current_password = Zeroizing::new(BASE64.encode(secret.as_slice()));
+
+    let mut result = Vec::with_capacity(entries.len());
+
+    for (position, (id, entry)) in entries.iter().enumerate() {
+        let (next_title, next_username, next_password) = match entries.get(position + 1) {
+            Some((_, next)) => (&next.title, &next.username, &next.password),
+            None => (&metadata.title, &metadata.username, &*current_password),
+        };
+
+        result.push(HistoryInfo {
+            id: id.clone(),
+            replaced_at: entry.replaced_at,
+            title: entry.title.clone(),
+            username: entry.username.clone(),
+            title_changed: &entry.title != next_title,
+            username_changed: &entry.username != next_username,
+            password_changed: &entry.password != next_password,
+        });
+    }
+
+    result.reverse();
+    Ok(result)
 }
 
-/// Geçmişteki bir parolayı çözer.
+/// Bir geçmiş kaydındaki parolayı çözer.
 pub fn decrypt_history_password(
     identity: &IdentityKeyPair,
     item: &EncryptedItem,
-    index: usize,
+    record: &HistoryRecord,
 ) -> Result<Zeroizing<Vec<u8>>, String> {
     let dek = unwrap_item_dek(identity, item)?;
-    let entries = open_history(item, &dek)?;
-    let entry = entries
-        .get(index)
-        .ok_or_else(|| "Geçmişte bu parola bulunamadı.".to_string())?;
+    let entry = open_history_entry(record, &dek, &history_aad(&item.owner_id, &item.item_id))?;
 
     BASE64
         .decode(&entry.password)
@@ -456,10 +478,11 @@ pub fn rekey(
     identity: &IdentityKeyPair,
     owner_id: &str,
     item: &EncryptedItem,
+    history: &[HistoryRecord],
     recipients: &[Recipient],
     departments: &[DepartmentRecipient],
 ) -> Result<RekeyedItem, String> {
-    reencrypt(identity, owner_id, item, recipients, departments, None)
+    reencrypt(identity, owner_id, item, history, recipients, departments, None)
 }
 
 /// Kayıtta yapılacak değişiklik. `password` boşsa mevcut parola korunur.
@@ -476,17 +499,19 @@ pub fn edit(
     identity: &IdentityKeyPair,
     owner_id: &str,
     item: &EncryptedItem,
+    history: &[HistoryRecord],
     recipients: &[Recipient],
     departments: &[DepartmentRecipient],
     changes: &ItemChanges,
 ) -> Result<RekeyedItem, String> {
-    reencrypt(identity, owner_id, item, recipients, departments, Some(changes))
+    reencrypt(identity, owner_id, item, history, recipients, departments, Some(changes))
 }
 
 fn reencrypt(
     identity: &IdentityKeyPair,
     owner_id: &str,
     item: &EncryptedItem,
+    history: &[HistoryRecord],
     recipients: &[Recipient],
     departments: &[DepartmentRecipient],
     changes: Option<&ItemChanges>,
@@ -496,13 +521,28 @@ fn reencrypt(
     let old_dek = unwrap_item_dek(identity, item)?;
     let metadata_aad = metadata_aad(&item.owner_id, &item.item_id);
     let secret_aad = secret_aad(&item.owner_id, &item.item_id);
+
     let history_aad = history_aad(&item.owner_id, &item.item_id);
 
     let mut metadata = open(&item.metadata, &old_dek, &metadata_aad)?;
     let mut secret = open(&item.secret, &old_dek, &secret_aad)?;
-    let mut history = open_history(item, &old_dek)?;
+
+    // Mevcut geçmiş kayıtları eski DEK ile açılır; açılamayan varsa rekey
+    // yapılmaz (aksi halde geçmiş kaybolurdu).
+    let mut history_plain = Vec::with_capacity(history.len() + 1);
+    for record in history {
+        let id = record
+            .id
+            .clone()
+            .ok_or_else(|| "Geçmiş kaydının kimliği eksik.".to_string())?;
+        let plaintext = open(&record.entry, &old_dek, &history_aad)
+            .map_err(|_| "Parola geçmişi çözülemedi.".to_string())?;
+        history_plain.push((Some(id), plaintext));
+    }
 
     if let Some(changes) = changes {
+        let previous: ItemMetadata = serde_json::from_slice(&metadata)
+            .map_err(|_| "Kaydın meta verisi okunamadı.".to_string())?;
         let updated = ItemMetadata {
             title: changes.title.trim().to_string(),
             username: changes
@@ -513,23 +553,31 @@ fn reencrypt(
         };
 
         validate_metadata(&updated)?;
-        metadata = Zeroizing::new(serde_json::to_vec(&updated).map_err(|error| error.to_string())?);
 
-        if let Some(password) = changes.password {
-            validate_secret(password)?;
-
-            if password != secret.as_slice() {
-                history.push(HistoryEntry {
-                    password: BASE64.encode(secret.as_slice()),
-                    replaced_at: now_ms(),
-                });
-
-                let excess = history.len().saturating_sub(MAX_HISTORY_ENTRIES);
-                history.drain(..excess);
-
-                secret = Zeroizing::new(password.to_vec());
+        let new_secret = match changes.password {
+            Some(password) => {
+                validate_secret(password)?;
+                Zeroizing::new(password.to_vec())
             }
+            None => secret.clone(),
+        };
+
+        // Herhangi bir değişiklikte önceki hal geçmişe eklenir.
+        if updated != previous || new_secret.as_slice() != secret.as_slice() {
+            let entry = HistoryEntry {
+                title: previous.title.clone(),
+                username: previous.username.clone(),
+                password: BASE64.encode(secret.as_slice()),
+                replaced_at: now_ms(),
+            };
+            history_plain.push((
+                None,
+                Zeroizing::new(serde_json::to_vec(&entry).map_err(|error| error.to_string())?),
+            ));
         }
+
+        metadata = Zeroizing::new(serde_json::to_vec(&updated).map_err(|error| error.to_string())?);
+        secret = new_secret;
     }
 
     let new_dek = password_encryption::generate_dek();
@@ -566,7 +614,15 @@ fn reencrypt(
     Ok(RekeyedItem {
         metadata: seal(&metadata, &new_dek, &metadata_aad)?,
         secret: seal(&secret, &new_dek, &secret_aad)?,
-        history: seal_history(&history, &new_dek, &history_aad)?,
+        history: history_plain
+            .iter()
+            .map(|(id, plaintext)| {
+                Ok(HistoryRecord {
+                    id: id.clone(),
+                    entry: seal(plaintext, &new_dek, &history_aad)?,
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?,
         accesses,
         department_accesses,
     })
@@ -582,7 +638,6 @@ mod tests {
             owner_id: owner_id.to_string(),
             metadata: new_item.metadata.clone(),
             secret: new_item.secret.clone(),
-            history: None,
             access: ItemAccess::Direct { access },
         }
     }
@@ -634,7 +689,7 @@ mod tests {
         let new_item = encrypt_new_item(&owner, "owner", "VPN", None, b"pw").unwrap();
         let item = stored(&new_item, "owner", new_item.owner_access.clone());
 
-        assert!(rekey(&other, "other", &item, &[], &[]).is_err());
+        assert!(rekey(&other, "other", &item, &[], &[], &[]).is_err());
     }
 
     #[test]
@@ -690,6 +745,7 @@ mod tests {
             &owner,
             "owner",
             &owner_item,
+            &[],
             &[Recipient {
                 user_id: "kept".to_string(),
                 public_key: encode_public_key(&kept.public_key()),
@@ -706,7 +762,6 @@ mod tests {
             owner_id: "owner".to_string(),
             metadata: rekeyed.metadata.clone(),
             secret: rekeyed.secret.clone(),
-            history: rekeyed.history.clone(),
             access: ItemAccess::Direct { access },
         };
 
@@ -737,6 +792,7 @@ mod tests {
             &owner,
             "owner",
             &owner_item,
+            &[],
             &recipients,
             &[],
             &ItemChanges { title: " Yeni ", username: Some(" "), password: None },
@@ -762,6 +818,7 @@ mod tests {
             &owner_item,
             &[],
             &[],
+            &[],
             &ItemChanges { title: "Yeni", username: None, password: Some(b"pw2") },
         )
         .unwrap();
@@ -775,8 +832,28 @@ mod tests {
         assert_eq!(decrypt_secret(&owner, &as_owner).unwrap().as_slice(), b"pw2");
     }
 
+    fn apply(item: &EncryptedItem, result: RekeyedItem, history: &mut Vec<HistoryRecord>) -> EncryptedItem {
+        // Sunucunun yaptığı gibi yeni geçmiş kaydına kimlik verilir.
+        *history = result
+            .history
+            .into_iter()
+            .enumerate()
+            .map(|(n, record)| HistoryRecord {
+                id: Some(record.id.unwrap_or_else(|| format!("h{n}"))),
+                entry: record.entry,
+            })
+            .collect();
+
+        EncryptedItem {
+            metadata: result.metadata,
+            secret: result.secret,
+            access: ItemAccess::Direct { access: result.accesses[0].access.clone() },
+            ..item.clone()
+        }
+    }
+
     #[test]
-    fn changed_password_goes_to_history_readable_by_recipients() {
+    fn every_change_goes_to_history_readable_by_recipients() {
         let owner = IdentityKeyPair::generate();
         let recipient = IdentityKeyPair::generate();
         let removed = IdentityKeyPair::generate();
@@ -785,104 +862,91 @@ mod tests {
             public_key: encode_public_key(&recipient.public_key()),
         }];
 
-        let new_item = encrypt_new_item(&owner, "owner", "VPN", None, b"pw1").unwrap();
+        let new_item = encrypt_new_item(&owner, "owner", "VPN", Some("ali"), b"pw1").unwrap();
         let mut item = stored(&new_item, "owner", new_item.owner_access.clone());
-        let removed_access = wrap_for_recipient(
-            &owner,
-            &item,
-            &encode_public_key(&removed.public_key()),
-        )
-        .unwrap();
+        let mut history = Vec::new();
+        let removed_access =
+            wrap_for_recipient(&owner, &item, &encode_public_key(&removed.public_key())).unwrap();
 
-        let apply = |item: &EncryptedItem, result: RekeyedItem| EncryptedItem {
-            metadata: result.metadata,
-            secret: result.secret,
-            history: result.history,
-            access: ItemAccess::Direct { access: result.accesses[0].access.clone() },
+        // Hiçbir şey değişmezse geçmişe yazılmaz.
+        let same = ItemChanges { title: "VPN", username: Some("ali"), password: Some(b"pw1") };
+        let unchanged = edit(&owner, "owner", &item, &history, &recipients, &[], &same).unwrap();
+        item = apply(&item, unchanged, &mut history);
+        assert!(history.is_empty());
+
+        // Yalnızca başlık değişikliği de geçmişe yazılır.
+        let renamed = ItemChanges { title: "VPN 2", username: Some("ali"), password: None };
+        item = apply(&item, edit(&owner, "owner", &item, &history, &recipients, &[], &renamed).unwrap(), &mut history);
+
+        let new_password = ItemChanges { title: "VPN 2", username: None, password: Some(b"pw2") };
+        item = apply(&item, edit(&owner, "owner", &item, &history, &recipients, &[], &new_password).unwrap(), &mut history);
+        assert_eq!(history.len(), 2);
+
+        // Rekey bütün geçmişi yeni DEK'e taşır.
+        let rekeyed = rekey(&owner, "owner", &item, &history, &recipients, &[]).unwrap();
+        let recipient_access = rekeyed.accesses[1].access.clone();
+        let item = apply(&item, rekeyed, &mut history);
+        let as_recipient = EncryptedItem {
+            access: ItemAccess::Direct { access: recipient_access },
             ..item.clone()
         };
 
-        assert!(history_summary(&owner, &item).unwrap().is_empty());
+        let summary = history_summary(&recipient, &as_recipient, &history).unwrap();
+        let shape: Vec<_> = summary
+            .iter()
+            .map(|e| (e.title.as_str(), e.username.as_deref(), e.title_changed, e.username_changed, e.password_changed))
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("VPN 2", Some("ali"), false, true, true),
+                ("VPN", Some("ali"), true, false, false),
+            ]
+        );
 
-        // Başlık değişikliği ve aynı parola geçmişe yazılmaz.
-        let same = ItemChanges { title: "VPN 2", username: None, password: Some(b"pw1") };
-        item = apply(&item, edit(&owner, "owner", &item, &recipients, &[], &same).unwrap());
-        assert!(item.history.is_none());
-
-        for password in [b"pw2".as_slice(), b"pw3".as_slice()] {
-            let changes = ItemChanges { title: "VPN", username: None, password: Some(password) };
-            item = apply(&item, edit(&owner, "owner", &item, &recipients, &[], &changes).unwrap());
-        }
-
-        // Rekey geçmişi yeni DEK'e taşır.
-        let rekeyed = rekey(&owner, "owner", &item, &recipients, &[]).unwrap();
-        let as_recipient = EncryptedItem {
-            access: ItemAccess::Direct { access: rekeyed.accesses[1].access.clone() },
-            ..apply(&item, rekeyed)
-        };
-
-        let summary = history_summary(&recipient, &as_recipient).unwrap();
-        assert_eq!(summary.iter().map(|entry| entry.index).collect::<Vec<_>>(), [1, 0]);
-        assert_eq!(decrypt_history_password(&recipient, &as_recipient, 0).unwrap().as_slice(), b"pw1");
-        assert_eq!(decrypt_history_password(&recipient, &as_recipient, 1).unwrap().as_slice(), b"pw2");
-        assert!(decrypt_history_password(&recipient, &as_recipient, 2).is_err());
+        let oldest = history.iter().find(|r| r.id.as_deref() == Some(&summary[1].id)).unwrap();
+        assert_eq!(decrypt_history_password(&recipient, &as_recipient, oldest).unwrap().as_slice(), b"pw1");
 
         // Erişimi kaldırılan kişinin eski DEK'i geçmişi açamaz.
         let as_removed = EncryptedItem {
             access: ItemAccess::Direct { access: removed_access },
             ..as_recipient.clone()
         };
-        assert!(history_summary(&removed, &as_removed).is_err());
+        assert!(history_summary(&removed, &as_removed, &history).is_err());
     }
 
     #[test]
-    fn history_keeps_only_the_latest_entries() {
-        let owner = IdentityKeyPair::generate();
-        let new_item = encrypt_new_item(&owner, "owner", "VPN", None, b"pw0").unwrap();
-        let mut item = stored(&new_item, "owner", new_item.owner_access.clone());
-
-        for n in 1..=MAX_HISTORY_ENTRIES + 3 {
-            let password = format!("pw{n}");
-            let changes = ItemChanges { title: "VPN", username: None, password: Some(password.as_bytes()) };
-            let edited = edit(&owner, "owner", &item, &[], &[], &changes).unwrap();
-            item = EncryptedItem {
-                metadata: edited.metadata,
-                secret: edited.secret,
-                history: edited.history,
-                access: ItemAccess::Direct { access: edited.accesses[0].access.clone() },
-                ..item.clone()
-            };
-        }
-
-        assert_eq!(history_summary(&owner, &item).unwrap().len(), MAX_HISTORY_ENTRIES);
-        assert_eq!(decrypt_history_password(&owner, &item, 0).unwrap().as_slice(), b"pw3");
-    }
-
-    #[test]
-    fn history_stays_under_the_server_size_limit() {
+    fn history_is_not_limited() {
         let owner = IdentityKeyPair::generate();
         let new_item = encrypt_new_item(&owner, "owner", "VPN", None, &[b'a'; 4000]).unwrap();
         let mut item = stored(&new_item, "owner", new_item.owner_access.clone());
+        let mut history = Vec::new();
 
-        for fill in b'b'..=b'f' {
-            let password = [fill; 4000];
-            let changes = ItemChanges { title: "VPN", username: None, password: Some(&password) };
-            let edited = edit(&owner, "owner", &item, &[], &[], &changes).unwrap();
-            item = EncryptedItem {
-                metadata: edited.metadata,
-                secret: edited.secret,
-                history: edited.history,
-                access: ItemAccess::Direct { access: edited.accesses[0].access.clone() },
-                ..item.clone()
-            };
+        for n in 1..=30u32 {
+            let password = format!("{n:04000}");
+            let changes = ItemChanges { title: "VPN", username: None, password: Some(password.as_bytes()) };
+            let edited = edit(&owner, "owner", &item, &history, &[], &[], &changes).unwrap();
+            item = apply(&item, edited, &mut history);
         }
 
-        assert!(item.history.as_ref().unwrap().ciphertext.len() <= 16 * 1024);
-        let summary = history_summary(&owner, &item).unwrap();
-        assert!(!summary.is_empty() && summary.len() < 5);
-        // En yenisi (son değiştirilen 'e' parolası) korunur.
-        let newest = decrypt_history_password(&owner, &item, summary[0].index).unwrap();
-        assert_eq!(newest.as_slice(), [b'e'; 4000]);
+        assert_eq!(history_summary(&owner, &item, &history).unwrap().len(), 30);
+        assert!(history.iter().all(|record| record.entry.ciphertext.len() <= 16 * 1024));
+    }
+
+    #[test]
+    fn history_from_another_item_is_rejected() {
+        let owner = IdentityKeyPair::generate();
+        let a = encrypt_new_item(&owner, "owner", "A", None, b"pw").unwrap();
+        let b = encrypt_new_item(&owner, "owner", "B", None, b"pw").unwrap();
+        let item_a = stored(&a, "owner", a.owner_access.clone());
+        let item_b = stored(&b, "owner", b.owner_access.clone());
+
+        let mut history = Vec::new();
+        let changes = ItemChanges { title: "A2", username: None, password: None };
+        apply(&item_a, edit(&owner, "owner", &item_a, &[], &[], &[], &changes).unwrap(), &mut history);
+
+        // Rekey, açılamayan bir geçmiş kaydıyla yapılmaz (geçmiş kaybolmasın).
+        assert!(rekey(&owner, "owner", &item_b, &history, &[], &[]).is_err());
     }
 
     #[test]
@@ -892,13 +956,13 @@ mod tests {
         let item = stored(&new_item, "owner", new_item.owner_access.clone());
 
         let changes = ItemChanges { title: "B", username: None, password: None };
-        assert!(edit(&owner, "other", &item, &[], &[], &changes).is_err());
+        assert!(edit(&owner, "other", &item, &[], &[], &[], &changes).is_err());
 
         let empty_title = ItemChanges { title: " ", username: None, password: None };
-        assert!(edit(&owner, "owner", &item, &[], &[], &empty_title).is_err());
+        assert!(edit(&owner, "owner", &item, &[], &[], &[], &empty_title).is_err());
 
         let empty_password = ItemChanges { title: "B", username: None, password: Some(b"") };
-        assert!(edit(&owner, "owner", &item, &[], &[], &empty_password).is_err());
+        assert!(edit(&owner, "owner", &item, &[], &[], &[], &empty_password).is_err());
     }
 
     #[test]
@@ -939,6 +1003,7 @@ mod tests {
             &owner,
             "owner",
             &owner_item,
+            &[],
             &[],
             &[DepartmentRecipient {
                 department_id: "d1".to_string(),

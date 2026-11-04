@@ -516,8 +516,9 @@ fn copy_item_password_to_clipboard(
 fn item_password_history(
     session: tauri::State<'_, Arc<VaultSession>>,
     item: EncryptedItem,
+    history: Vec<items::HistoryRecord>,
 ) -> Result<Vec<items::HistoryInfo>, String> {
-    session.with_identity(|identity, _| items::history_summary(identity, &item))
+    session.with_identity(|identity, _| items::history_summary(identity, &item, &history))
 }
 
 /// Geçmişteki bir parolayı Rust tarafında çözer ve panoya yazar.
@@ -526,10 +527,10 @@ fn copy_item_history_password_to_clipboard(
     app: tauri::AppHandle,
     session: tauri::State<'_, Arc<VaultSession>>,
     item: EncryptedItem,
-    index: usize,
+    record: items::HistoryRecord,
 ) -> Result<(), String> {
     let plaintext_bytes = session.with_identity(|identity, _| {
-        items::decrypt_history_password(identity, &item, index)
+        items::decrypt_history_password(identity, &item, &record)
     })?;
 
     copy_secret_to_clipboard(app, plaintext_bytes)
@@ -567,11 +568,12 @@ fn wrap_item_key_for_recipient(
 fn rekey_item(
     session: tauri::State<'_, Arc<VaultSession>>,
     item: EncryptedItem,
+    history: Vec<items::HistoryRecord>,
     recipients: Vec<Recipient>,
     department_recipients: Vec<DepartmentRecipient>,
 ) -> Result<RekeyedItem, String> {
     session.with_identity(|identity, owner| {
-        items::rekey(identity, &owner.user_id, &item, &recipients, &department_recipients)
+        items::rekey(identity, &owner.user_id, &item, &history, &recipients, &department_recipients)
     })
 }
 
@@ -581,6 +583,7 @@ fn rekey_item(
 fn edit_item(
     session: tauri::State<'_, Arc<VaultSession>>,
     item: EncryptedItem,
+    history: Vec<items::HistoryRecord>,
     recipients: Vec<Recipient>,
     department_recipients: Vec<DepartmentRecipient>,
     title: String,
@@ -594,6 +597,7 @@ fn edit_item(
             identity,
             &owner.user_id,
             &item,
+            &history,
             &recipients,
             &department_recipients,
             &items::ItemChanges {

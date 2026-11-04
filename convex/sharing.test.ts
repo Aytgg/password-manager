@@ -267,8 +267,8 @@ describe("departman anahtarları", () => {
 
     expect(await visible(uid("bob"))).toEqual([id]);
     expect(await visible(uid("carol"))).toEqual([]);
-    // Yönetici anahtarı tutar ama kural gereği listede görmez.
-    expect(await visible(uid("admin"))).toEqual([]);
+    // Yöneticiler bütün parolaları görür.
+    expect(await visible(uid("admin"))).toEqual([id]);
 
     const [item] = await as("bob").query(api.items.listMine, {});
     expect(item.access).toEqual({
@@ -325,7 +325,8 @@ describe("departman anahtarları", () => {
     expect(sharing.users.find((u) => u.userId === vendor)).toMatchObject({ status: "invited" });
 
     await shareWithUser("alice", id, vendor);
-    expect(await directAccessNames(id)).toHaveLength(2);
+    // Sahip, yönetici ve davetli.
+    expect(await directAccessNames(id)).toHaveLength(3);
 
     // Gece kaydolur; kimsenin çevrimiçi olması gerekmez.
     await activate(vendor);
@@ -472,7 +473,7 @@ describe("kişiye paylaşım ve rekey", () => {
     await as("alice").mutation(api.items.setUserGrant, { id, userId: uid("carol"), granted: false });
 
     expect(await visible(uid("carol"))).toEqual([]);
-    expect(await directAccessNames(id)).toEqual(["alice"]);
+    expect(await directAccessNames(id)).toEqual(["admin", "alice"]);
     expect((await getItem(id))!.needsRekey).toBe(true);
   });
 
@@ -487,7 +488,7 @@ describe("kişiye paylaşım ve rekey", () => {
     await as("alice").mutation(api.items.setUserGrant, { id, userId: uid("carol"), granted: false });
 
     const task = (await as("alice").query(api.items.pendingWork, {})).rekeys[0];
-    expect(task.recipients).toEqual([]);
+    expect(task.recipients.map((r) => r.userId)).toEqual([uid("admin")]);
     expect(task.departments).toEqual([
       { departmentId: ids.yazilim, keyVersion: 1, publicKey: publicKey(90) },
     ]);
@@ -545,7 +546,7 @@ describe("kişiye paylaşım ve rekey", () => {
 
     const targets = await as("alice").query(api.items.editTargets, { id });
     expect(targets.item.access.kind).toBe("direct");
-    expect(targets.recipients.map((r) => r.userId)).toEqual([uid("carol")]);
+    expect(targets.recipients.map((r) => r.userId).sort()).toEqual([uid("admin"), uid("carol")].sort());
     expect(targets.departments.map((d) => d.departmentId)).toEqual([ids.yazilim]);
 
     await as("alice").mutation(api.items.rekey, {
@@ -632,42 +633,101 @@ describe("kişiye paylaşım ve rekey", () => {
   });
 
   test("parola geçmişi rekey ile saklanır, erişimi olanlara gelir ve kaybedilemez", async () => {
-    const { ids, uid, as, runDepartmentWork, createItem, shareWithDepartment, getItem } = await setup();
+    const { t, ids, uid, as, runDepartmentWork, runItemWork, createItem, shareWithDepartment, getItem } =
+      await setup();
     await runDepartmentWork();
 
     const id = await createItem("alice");
     await shareWithDepartment("alice", id, ids.satis);
 
-    const keyVersion = async () => (await getItem(id))!.keyVersion;
+    const rekey = async (history: { id?: Id<"itemHistory">; entry: ReturnType<typeof sealed> }[]) =>
+      as("alice").mutation(api.items.rekey, {
+        id,
+        keyVersion: (await getItem(id))!.keyVersion,
+        metadata: sealed(5),
+        secret: sealed(6),
+        history,
+        accesses: [{ userId: uid("alice"), access: wrapped(7) }],
+        departmentAccesses: [{ departmentId: ids.satis, keyVersion: 1, access: wrapped(8) }],
+      });
+    const records = async (name: "alice" | "carol" | "admin" | "bob") =>
+      (await as(name).query(api.items.history, { id })).history;
 
-    await as("alice").mutation(api.items.rekey, {
-      id,
-      keyVersion: await keyVersion(),
-      metadata: sealed(5),
-      secret: sealed(6),
-      history: sealed(9),
-      accesses: [{ userId: uid("alice"), access: wrapped(7) }],
-      departmentAccesses: [{ departmentId: ids.satis, keyVersion: 1, access: wrapped(8) }],
+    // Sınır yok: her düzenleme bir kayıt ekler.
+    for (let n = 1; n <= 25; n++) {
+      const existing = await records("alice");
+      await rekey([...existing.map((r) => ({ id: r.id, entry: sealed(n) })), { entry: sealed(n) }]);
+    }
+
+    // Departman üyesi (carol) ve yönetici geçmişi görür; erişimi olmayan (bob) göremez.
+    const carolView = await as("carol").query(api.items.history, { id });
+    expect(carolView.item.access.kind).toBe("department");
+    expect(carolView.history).toHaveLength(25);
+    // Rekey'de yöneticinin paketi eksik kaldı; sahibin cihazı tamamlar.
+    await runItemWork("alice");
+    expect(await records("admin")).toHaveLength(25);
+    await expect(records("bob")).rejects.toThrow(/erişimin yok/);
+
+    // Geçmiş silinemez, yerine başka kayıt konamaz, iki yeni kayıt eklenemez.
+    const existing = await records("alice");
+    await expect(rekey([])).rejects.toThrow(/geçmişi eksik/);
+    await expect(rekey(existing.slice(1))).rejects.toThrow(/geçmişi eksik/);
+    await expect(rekey([...existing, existing[0]])).rejects.toThrow(/geçmişi değişti/);
+    await expect(rekey([...existing, { entry: sealed(1) }, { entry: sealed(2) }])).rejects.toThrow(
+      /geçmişi eksik/,
+    );
+    await expect(
+      as("alice").mutation(api.items.rekey, {
+        id,
+        keyVersion: (await getItem(id))!.keyVersion,
+        metadata: sealed(5),
+        secret: sealed(6),
+        accesses: [{ userId: uid("alice"), access: wrapped(7) }],
+        departmentAccesses: [{ departmentId: ids.satis, keyVersion: 1, access: wrapped(8) }],
+      }),
+    ).rejects.toThrow(/geçmişi eksik/);
+
+    // Kayıt silinince geçmişi de silinir.
+    await as("alice").mutation(api.items.remove, { id });
+    expect(await t.run((ctx) => ctx.db.query("itemHistory").collect())).toEqual([]);
+  });
+
+  test("yöneticiler paylaşılmamış parolaları da görür; yöneticilik kalkınca erişim gider", async () => {
+    const { t, ids, as, asId, createItem, runItemWork, visible, directAccessNames, getItem } =
+      await setup();
+
+    const second = await t.run((ctx) =>
+      ctx.db.insert("users", {
+        email: "admin2@vs.com",
+        publicKey: publicKey(6),
+        role: "admin",
+        status: "active",
+        createdAt: 0,
+        updatedAt: 0,
+      }),
+    );
+
+    const id = await createItem("alice");
+
+    // Anahtar sahibin cihazında üretilene kadar "hazırlanıyor" sayılır.
+    expect(await asId(second).query(api.items.pendingSharedCount, {})).toBe(1);
+
+    await runItemWork("alice");
+    expect(await directAccessNames(id)).toEqual(expect.arrayContaining(["admin", "alice", second]));
+    expect(await visible(second)).toEqual([id]);
+    expect(await asId(second).query(api.items.pendingSharedCount, {})).toBe(0);
+    expect(
+      (await as("alice").query(api.items.sharing, { id })).users.find((u) => u.userId === second),
+    ).toMatchObject({ isAdmin: true, hasKey: true, direct: false });
+
+    await as("admin").mutation(api.members.update, {
+      id: second,
+      role: "member",
+      departmentId: ids.satis,
     });
 
-    const carolItems = await as("carol").query(api.items.listMine, {});
-    expect(carolItems.find((item) => item.id === id)?.history).toEqual(sealed(9));
-
-    // Geçmişi göndermeyen (eski) istemci geçmişi silemez.
-    for (const history of [undefined, null]) {
-      await expect(
-        as("alice").mutation(api.items.rekey, {
-          id,
-          keyVersion: await keyVersion(),
-          metadata: sealed(5),
-          secret: sealed(6),
-          ...(history === undefined ? {} : { history }),
-          accesses: [{ userId: uid("alice"), access: wrapped(7) }],
-          departmentAccesses: [{ departmentId: ids.satis, keyVersion: 1, access: wrapped(8) }],
-        }),
-      ).rejects.toThrow(/geçmişi eksik/);
-    }
-    expect((await getItem(id))!.history).toEqual(sealed(9));
+    expect(await visible(second)).toEqual([]);
+    expect((await getItem(id))!.needsRekey).toBe(true);
   });
 
   test("rekey beklerken eski anahtar dağıtılmaz", async () => {
@@ -725,7 +785,7 @@ describe("kişiye paylaşım ve rekey", () => {
 
     await as("admin").mutation(api.members.update, { id: uid("carol"), enabled: false });
 
-    expect(await directAccessNames(id)).toEqual(["alice"]);
+    expect(await directAccessNames(id)).toEqual(["admin", "alice"]);
     expect(await departmentKeyNames(ids.satis)).toEqual(["admin", "manager"]);
     await expect(as("carol").query(api.items.listMine, {})).rejects.toThrow(/erişim yetkisi yok/);
   });
@@ -742,13 +802,13 @@ describe("kişiye paylaşım ve rekey", () => {
 
     await as("carol").mutation(api.users.setPublicKey, { publicKey: publicKey(9) });
 
-    expect(await directAccessNames(id)).toEqual(["alice"]);
+    expect(await directAccessNames(id)).toEqual(["admin", "alice"]);
     expect(await departmentKeyNames(ids.satis)).toEqual(["admin", "manager"]);
 
     await runItemWork("alice");
     await runDepartmentWork();
 
-    expect(await directAccessNames(id)).toEqual(["alice", "carol"]);
+    expect(await directAccessNames(id)).toEqual(["admin", "alice", "carol"]);
     expect(await departmentKeyNames(ids.satis)).toEqual(["admin", "carol", "manager"]);
   });
 

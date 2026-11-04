@@ -78,8 +78,6 @@ export default defineSchema({
     ownerId: v.id("users"),
     metadata: sealedField,
     secret: sealedField,
-    // Eski parolalar; aynı DEK ile şifreli. Parola hiç değişmediyse yok.
-    history: v.optional(sealedField),
     keyVersion: v.number(),
     needsRekey: v.boolean(),
     createdAt: v.number(),
@@ -87,6 +85,14 @@ export default defineSchema({
   })
     .index("by_item_id", ["itemId"])
     .index("by_owner", ["ownerId"]),
+
+  // Kaydın önceki halleri (başlık, kullanıcı adı, parola); kaydın güncel
+  // DEK'i ile şifreli. Her rekey'de hepsi yeni DEK'e taşınır.
+  itemHistory: defineTable({
+    item: v.id("items"),
+    entry: sealedField,
+    createdAt: v.number(),
+  }).index("by_item", ["item"]),
 
   itemGrants: defineTable({
     item: v.id("items"),

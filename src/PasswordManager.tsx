@@ -9,6 +9,7 @@ import { errorMessage } from "./errors";
 import {
   toEncryptedItem,
   type GrantTarget,
+  type HistoryRecord,
   type NewItem,
   type QueuedOp,
   type VaultData,
@@ -258,19 +259,22 @@ function SharingPanel({
           const direct = grants.userIds.includes(user.userId);
           const viaDepartment =
             user.departmentId !== null && grants.departmentIds.includes(user.departmentId);
-          const allowed = direct || viaDepartment;
+          // Yöneticiler bütün parolaları görür; ayrıca yetki gerekmez.
+          const viaAdmin = user.isAdmin === true;
+          const allowed = direct || viaDepartment || viaAdmin;
           const hasKey = keyStatus.get(user.userId);
+          const route = direct ? "" : viaDepartment ? "Departman üzerinden " : viaAdmin ? "Yönetici olarak " : "";
 
           const access = !allowed
             ? "Erişim kapalı"
             : hasKey === undefined || item.pendingSync
-              ? direct
-                ? "Erişim verildi"
-                : "Departman üzerinden erişim verildi"
+              ? route
+                ? `${route}erişim verildi`
+                : "Erişim verildi"
               : hasKey
-                ? direct
-                  ? "Erişim açık"
-                  : "Departman üzerinden erişim açık"
+                ? route
+                  ? `${route}erişim açık`
+                  : "Erişim açık"
                 : "Anahtar hazırlanıyor...";
 
           // Davet edilen kişi henüz kaydolmamış olsa da paylaşım yapılabilir;
@@ -319,30 +323,56 @@ function SharingPanel({
 
 type PanelKind = "sharing" | "edit" | "history";
 
-type HistoryInfo = { index: number; replacedAt: number };
+type HistoryInfo = {
+  id: Id<"itemHistory">;
+  replacedAt: number;
+  title: string;
+  username: string | null;
+  titleChanged: boolean;
+  usernameChanged: boolean;
+  passwordChanged: boolean;
+};
 
 const historyDateFormat = new Intl.DateTimeFormat("tr-TR", {
   dateStyle: "medium",
   timeStyle: "short",
 });
 
+function describeChange(entry: HistoryInfo) {
+  const changes = [
+    entry.titleChanged && "başlık",
+    entry.usernameChanged && "kullanıcı adı",
+    entry.passwordChanged && "parola",
+  ].filter(Boolean);
+
+  return changes.length > 0 ? `${changes.join(", ")} değişti` : "değişiklik yok";
+}
+
 /**
- * Parolanın eski değerleri. Parolayı açabilen herkes görür; liste yalnızca
- * değiştirilme zamanlarını gösterir, eski parolalar da güncel parola gibi
- * yalnızca panoya kopyalanır (açık metin React'e gelmez).
+ * Kaydın önceki halleri; kaydı açabilen herkes görür. Geçmiş sunucudan
+ * istenir (çevrimiçi). Başlık ve kullanıcı adı gösterilir; eski parolalar
+ * güncel parola gibi yalnızca panoya kopyalanır (açık metin React'e gelmez).
  */
-function PasswordHistoryPanel({ item, onCopied }: { item: VaultItem; onCopied: () => void }) {
+function PasswordHistoryPanel({ id, onCopied }: { id: Id<"items">; onCopied: () => void }) {
+  const server = useQuery(api.items.history, { id });
   const [entries, setEntries] = useState<HistoryInfo[] | null>(null);
-  const [copyingIndex, setCopyingIndex] = useState<number | null>(null);
+  const [copyingId, setCopyingId] = useState<string | null>(null);
   const [error, setError] = useState("");
 
   useEffect(() => {
-    let cancelled = false;
-    setEntries(null);
+    if (!server) return;
 
-    invoke<HistoryInfo[]>("item_password_history", { item: item.encrypted })
+    let cancelled = false;
+
+    invoke<HistoryInfo[]>("item_password_history", {
+      item: toEncryptedItem(server.item),
+      history: server.history,
+    })
       .then((result) => {
-        if (!cancelled) setEntries(result);
+        if (!cancelled) {
+          setEntries(result);
+          setError("");
+        }
       })
       .catch((err: unknown) => {
         if (!cancelled) setError(errorMessage(err));
@@ -351,27 +381,32 @@ function PasswordHistoryPanel({ item, onCopied }: { item: VaultItem; onCopied: (
     return () => {
       cancelled = true;
     };
-  }, [item.encrypted]);
+  }, [server]);
 
-  async function handleCopy(index: number) {
-    if (copyingIndex !== null) return;
+  async function handleCopy(entryId: Id<"itemHistory">) {
+    const record = server?.history.find((candidate) => candidate.id === entryId);
 
-    setCopyingIndex(index);
+    if (!server || !record || copyingId !== null) return;
+
+    setCopyingId(entryId);
     setError("");
 
     try {
-      await invoke("copy_item_history_password_to_clipboard", { item: item.encrypted, index });
+      await invoke("copy_item_history_password_to_clipboard", {
+        item: toEncryptedItem(server.item),
+        record,
+      });
       onCopied();
     } catch (err) {
       setError(errorMessage(err));
     } finally {
-      setCopyingIndex(null);
+      setCopyingId(null);
     }
   }
 
   return (
     <div>
-      <strong>Parola geçmişi</strong>
+      <strong>Geçmiş</strong>
 
       {error && (
         <p role="alert" style={styles.error}>
@@ -382,12 +417,12 @@ function PasswordHistoryPanel({ item, onCopied }: { item: VaultItem; onCopied: (
       {entries === null ? (
         !error && <p style={styles.muted}>Geçmiş yükleniyor...</p>
       ) : entries.length === 0 ? (
-        <p style={styles.muted}>Bu parola hiç değiştirilmemiş.</p>
+        <p style={styles.muted}>Bu kayıt hiç değiştirilmemiş.</p>
       ) : (
-        <div style={{ display: "grid", gap: 8, marginTop: 12 }}>
-          {entries.map((entry, position) => (
+        <div style={{ display: "grid", gap: 10, marginTop: 12 }}>
+          {entries.map((entry) => (
             <div
-              key={entry.index}
+              key={entry.id}
               style={{
                 display: "flex",
                 justifyContent: "space-between",
@@ -396,24 +431,29 @@ function PasswordHistoryPanel({ item, onCopied }: { item: VaultItem; onCopied: (
                 flexWrap: "wrap",
               }}
             >
-              <span style={{ fontSize: 13 }}>
-                {position === 0 ? "Bir önceki parola" : `${position + 1} önceki parola`}
-                <span style={{ ...styles.muted, marginLeft: 8 }}>
-                  {historyDateFormat.format(new Date(entry.replacedAt))} tarihinde değiştirildi
-                </span>
-              </span>
+              <div style={{ minWidth: 0 }}>
+                <div style={{ fontSize: 14 }}>
+                  {entry.title}
+                  <span style={{ ...styles.muted, marginLeft: 8, fontSize: 12 }}>
+                    {entry.username || "Kullanıcı adı yok"}
+                  </span>
+                </div>
+                <div style={{ ...styles.muted, fontSize: 12, marginTop: 2 }}>
+                  {historyDateFormat.format(new Date(entry.replacedAt))} · {describeChange(entry)}
+                </div>
+              </div>
 
               <button
                 type="button"
                 style={{
                   ...styles.secondaryButton,
-                  opacity: copyingIndex !== null ? 0.6 : 1,
-                  cursor: copyingIndex !== null ? "wait" : "pointer",
+                  opacity: copyingId !== null ? 0.6 : 1,
+                  cursor: copyingId !== null ? "wait" : "pointer",
                 }}
-                onClick={() => void handleCopy(entry.index)}
-                disabled={copyingIndex !== null}
+                onClick={() => void handleCopy(entry.id)}
+                disabled={copyingId !== null}
               >
-                {copyingIndex === entry.index ? "Kopyalanıyor..." : "Kopyala"}
+                {copyingId === entry.id ? "Kopyalanıyor..." : "O zamanki parolayı kopyala"}
               </button>
             </div>
           ))}
@@ -426,7 +466,7 @@ function PasswordHistoryPanel({ item, onCopied }: { item: VaultItem; onCopied: (
 type RekeyedItem = {
   metadata: SealedField;
   secret: SealedField;
-  history: SealedField | null;
+  history: HistoryRecord[];
   accesses: { userId: Id<"users">; access: WrappedKey }[];
   departmentAccesses: { departmentId: Id<"departments">; keyVersion: number; access: WrappedKey }[];
 };
@@ -481,6 +521,7 @@ function EditItemForm({
 
       const edited = await invoke<RekeyedItem>("edit_item", {
         item: toEncryptedItem(targets.item),
+        history: targets.history,
         recipients: targets.recipients,
         departmentRecipients: targets.departments,
         title: title.trim(),
@@ -942,9 +983,9 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
               openPanel?.itemId === itemId && openPanel.kind === "sharing";
             const canEdit = isOnline && id !== null && item.decrypted;
             const isEditOpen = canEdit && openPanel?.itemId === itemId && openPanel.kind === "edit";
-            const hasHistory = item.vault.encrypted.history !== null;
+            const canViewHistory = isOnline && id !== null;
             const isHistoryOpen =
-              hasHistory && openPanel?.itemId === itemId && openPanel.kind === "history";
+              canViewHistory && openPanel?.itemId === itemId && openPanel.kind === "history";
 
             return (
               <article key={itemId} style={styles.card}>
@@ -999,19 +1040,20 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
                       {copyingPasswordId === itemId ? "Kopyalanıyor..." : "Parolayı kopyala"}
                     </button>
 
-                    {hasHistory && (
-                      <button
-                        type="button"
-                        style={{
-                          ...styles.secondaryButton,
-                          background: isHistoryOpen ? "#4b5563" : styles.secondaryButton.background,
-                        }}
-                        onClick={() => togglePanel(itemId, "history")}
-                        aria-expanded={isHistoryOpen}
-                      >
-                        Geçmiş
-                      </button>
-                    )}
+                    <button
+                      type="button"
+                      style={{
+                        ...styles.secondaryButton,
+                        background: isHistoryOpen ? "#4b5563" : styles.secondaryButton.background,
+                        opacity: canViewHistory ? 1 : 0.5,
+                      }}
+                      onClick={() => togglePanel(itemId, "history")}
+                      disabled={!canViewHistory}
+                      title={isOnline ? undefined : "Geçmiş için bağlantı gerekli"}
+                      aria-expanded={isHistoryOpen}
+                    >
+                      Geçmiş
+                    </button>
 
                     {isOwner && (
                       <button
@@ -1046,7 +1088,7 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
                   </div>
                 </div>
 
-                {isHistoryOpen && (
+                {isHistoryOpen && id !== null && (
                   <div
                     style={{
                       marginTop: 18,
@@ -1055,7 +1097,7 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
                     }}
                   >
                     <PasswordHistoryPanel
-                      item={item.vault}
+                      id={id}
                       onCopied={() => {
                         setError("");
                         setSuccess(

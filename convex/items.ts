@@ -65,6 +65,17 @@ async function departmentAccessRow(
     .unique();
 }
 
+const historyRecord = v.object({ id: v.optional(v.id("itemHistory")), entry: sealedField });
+
+async function historyRecords(ctx: QueryCtx, itemId: Id<"items">) {
+  return (
+    await ctx.db
+      .query("itemHistory")
+      .withIndex("by_item", (q) => q.eq("item", itemId))
+      .collect()
+  ).map((row) => ({ id: row._id, entry: row.entry }));
+}
+
 type KeyPath =
   | { kind: "direct"; access: Doc<"itemAccess">["access"] }
   | {
@@ -86,7 +97,6 @@ function serialize(
     isOwner: item.ownerId === userId,
     metadata: item.metadata,
     secret: item.secret,
-    history: item.history ?? null,
     keyVersion: item.keyVersion,
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
@@ -104,6 +114,48 @@ async function ownerGrants(ctx: QueryCtx, item: Doc<"items">, userId: Id<"users"
   const { userIds, departmentIds } = await itemGrants(ctx, item._id);
   return { userIds: [...userIds], departmentIds: [...departmentIds] };
 }
+
+/** Kullanıcının kayda ulaşma yolu: doğrudan paket ya da departmanının
+ * güncel anahtarı. Erişimi yoksa `null`. */
+async function keyPath(ctx: QueryCtx, user: Doc<"users">, item: Doc<"items">): Promise<KeyPath | null> {
+  const direct = await myAccess(ctx, item._id, user._id);
+
+  if (direct) {
+    return { kind: "direct", access: direct.access };
+  }
+
+  const department = user.departmentId ? await ctx.db.get(user.departmentId) : null;
+  const departmentKey = department ? await currentDepartmentKey(ctx, department, user._id) : null;
+  const row = department ? await departmentAccessRow(ctx, item._id, department._id) : null;
+
+  if (department && departmentKey && row?.keyVersion === department.keyVersion) {
+    return { kind: "department", departmentKey: departmentKey.access, itemKey: row.access };
+  }
+
+  return null;
+}
+
+/**
+ * Kaydın geçmişi; kaydı açabilen herkes görebilir. Geçmiş kayıtları
+ * kaydın DEK'i ile şifreli olduğu için ulaşma yolu da birlikte döner.
+ */
+export const history = query({
+  args: { id: v.id("items") },
+  handler: async (ctx, args) => {
+    const user = await requireActiveUser(ctx);
+    const item = await ctx.db.get(args.id);
+    const path = item ? await keyPath(ctx, user, item) : null;
+
+    if (!item || !path) {
+      throw new ConvexError("Bu parolaya erişimin yok.");
+    }
+
+    return {
+      item: serialize(item, path, user._id),
+      history: await historyRecords(ctx, item._id),
+    };
+  },
+});
 
 /**
  * Kullanıcının açabildiği kayıtlar ve her birine ulaşma yolu: doğrudan
@@ -235,7 +287,7 @@ export const remove = mutation({
     const user = await requireActiveUser(ctx);
     const item = await requireOwnedItem(ctx, user._id, args.id);
 
-    for (const table of ["itemAccess", "itemDepartmentAccess", "itemGrants"] as const) {
+    for (const table of ["itemAccess", "itemDepartmentAccess", "itemGrants", "itemHistory"] as const) {
       for (const row of await ctx.db
         .query(table)
         .withIndex("by_item", (q) => q.eq("item", item._id))
@@ -272,6 +324,7 @@ export const shareDirectory = query({
           displayName: candidate.displayName ?? candidate.email,
           status: candidate.status,
           departmentId: candidate.departmentId ?? null,
+          isAdmin: candidate.role === "admin",
           departmentName: candidate.departmentId
             ? (departmentNames.get(candidate.departmentId) ?? null)
             : null,
@@ -338,6 +391,7 @@ export const sharing = query({
           : null,
         direct: grants.userIds.has(candidate._id),
         viaDepartment,
+        isAdmin: candidate.role === "admin",
         hasKey: directKeyUserIds.has(candidate._id) || hasDepartmentKey,
         hasPublicKey: candidate.publicKey !== undefined,
       });
@@ -541,7 +595,7 @@ export const rekey = mutation({
     keyVersion: v.number(),
     metadata: sealedField,
     secret: sealedField,
-    history: v.optional(v.union(sealedField, v.null())),
+    history: v.optional(v.array(historyRecord)),
     accesses: v.array(userAccess),
     departmentAccesses: v.array(departmentAccess),
   },
@@ -553,12 +607,27 @@ export const rekey = mutation({
     assertSealedField(args.metadata);
     assertSealedField(args.secret);
 
-    const history = args.history ?? undefined;
+    // Geçmiş eksiksiz gönderilmeli: mevcut her kayıt (yeni DEK ile) tam bir
+    // kez, yeni kayıt ise en fazla bir tane. Böylece geçmiş silinemez.
+    const existingHistory = new Set((await historyRecords(ctx, item._id)).map((row) => row.id));
+    const seenHistory = new Set<Id<"itemHistory">>();
+    let newHistory = 0;
 
-    if (history) {
-      assertSealedField(history);
-    } else if (item.history) {
-      // Geçmişi tanımayan eski bir istemci rekey yaparsa geçmiş kaybolmasın.
+    const historyArgs = args.history ?? [];
+
+    for (const record of historyArgs) {
+      assertSealedField(record.entry);
+
+      if (record.id === undefined) {
+        newHistory += 1;
+      } else if (!existingHistory.has(record.id) || seenHistory.has(record.id)) {
+        throw new ConvexError("Parola geçmişi değişti. Tekrar deneniyor.");
+      } else {
+        seenHistory.add(record.id);
+      }
+    }
+
+    if (seenHistory.size !== existingHistory.size || newHistory > 1) {
       throw new ConvexError("Parola geçmişi eksik. Uygulamayı güncelleyip tekrar dene.");
     }
 
@@ -610,11 +679,22 @@ export const rekey = mutation({
     await ctx.db.patch(item._id, {
       metadata: args.metadata,
       secret: args.secret,
-      history,
       keyVersion: item.keyVersion + 1,
       needsRekey: false,
       updatedAt: Date.now(),
     });
+
+    for (const record of historyArgs) {
+      if (record.id === undefined) {
+        await ctx.db.insert("itemHistory", {
+          item: item._id,
+          entry: record.entry,
+          createdAt: Date.now(),
+        });
+      } else {
+        await ctx.db.patch(record.id, { entry: record.entry });
+      }
+    }
 
     for (const access of await ctx.db
       .query("itemAccess")
@@ -712,6 +792,7 @@ export const editTargets = query({
 
     return {
       item: serialize(item, { kind: "direct", access: access.access }, user._id),
+      history: await historyRecords(ctx, item._id),
       ...(await rekeyRecipients(ctx, item, user._id)),
     };
   },
@@ -747,7 +828,11 @@ export const pendingWork = query({
 
       if (item.needsRekey) {
         if (item.ownerId === user._id) {
-          rekeys.push({ item: serialized, ...(await rekeyRecipients(ctx, item, user._id)) });
+          rekeys.push({
+            item: serialized,
+            history: await historyRecords(ctx, item._id),
+            ...(await rekeyRecipients(ctx, item, user._id)),
+          });
         }
 
         // Eski DEK artık dağıtılmamalı; eksikler rekey sonrası yeni DEK
@@ -804,9 +889,15 @@ export const pendingSharedCount = query({
         : []),
     ];
 
+    // Yöneticiler bütün kayıtları görür.
+    const itemIds =
+      user.role === "admin"
+        ? (await ctx.db.query("items").collect()).map((item) => item._id)
+        : grants.map((grant) => grant.item);
+
     let count = 0;
 
-    for (const itemId of new Set(grants.map((grant) => grant.item))) {
+    for (const itemId of new Set(itemIds)) {
       const item = await ctx.db.get(itemId);
 
       if (!item || item.ownerId === user._id || (await myAccess(ctx, itemId, user._id))) {

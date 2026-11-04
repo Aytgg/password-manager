@@ -138,9 +138,9 @@ export async function itemGrants(ctx: QueryCtx, itemId: Id<"items">) {
   };
 }
 
-/** DEK'i doğrudan kendi açık anahtarına paketlenmesi gerekenler: sahip ve
- * kişiye doğrudan yetki verilenler. Departman üyeleri departman anahtarı
- * üzerinden erişir. */
+/** DEK'i doğrudan kendi açık anahtarına paketlenmesi gerekenler: sahip,
+ * kişiye doğrudan yetki verilenler ve bütün yöneticiler (yöneticiler her
+ * parolayı görür). Departman üyeleri departman anahtarı üzerinden erişir. */
 export async function directRecipients(
   ctx: QueryCtx,
   item: Doc<"items">,
@@ -148,9 +148,15 @@ export async function directRecipients(
   const recipients = new Map<Id<"users">, ReachableUser>();
   const { userIds } = await itemGrants(ctx, item._id);
 
-  for (const userId of [item.ownerId, ...userIds]) {
-    const user = await ctx.db.get(userId);
+  const users = [
+    ...(await Promise.all([item.ownerId, ...userIds].map((userId) => ctx.db.get(userId)))),
+    ...(await ctx.db
+      .query("users")
+      .withIndex("by_role", (q) => q.eq("role", "admin"))
+      .collect()),
+  ];
 
+  for (const user of users) {
     if (user && isReachable(user)) {
       recipients.set(user._id, user);
     }

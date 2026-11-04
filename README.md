@@ -152,25 +152,34 @@ etkilenmez.
 
 ## Kayıtların şifrelenmesi
 
-Her kaydın kendine ait rastgele bir **DEK**'i (32 bayt) vardır. Kayıt en çok
-üç ayrı şifreli alan taşır:
+Her kaydın kendine ait rastgele bir **DEK**'i (32 bayt) vardır. Kayıt iki ayrı
+şifreli alan taşır; kaydın önceki halleri de ayrı satırlarda aynı DEK ile
+şifrelenir:
 
 | Alan | İçerik | AAD |
 |---|---|---|
 | `metadata` | `{ "title", "username" }` JSON | `password-manager/item/v1/metadata:{sahipId}:{kayıtId}` |
 | `secret` | Parola baytları | `password-manager/item/v1/secret:{sahipId}:{kayıtId}` |
-| `history` (isteğe bağlı) | Eski parolalar: `[{ "password" (base64), "replacedAt" }]` JSON | `password-manager/item/v1/history:{sahipId}:{kayıtId}` |
+| `itemHistory.entry` | Önceki hal: `{ "title", "username", "password" (base64), "replacedAt" }` JSON | `password-manager/item/v1/history:{sahipId}:{kayıtId}` |
 
 Alanların ayrı olması sayesinde liste görüntülenirken parolaların kendisi
-çözülmez.
-
-Parola değiştirildiğinde eski değer `history` alanına eklenir (en çok 20
-kayıt ve 10 KB; sığmayan en eskiler düşülür). Geçmiş aynı DEK ile
-şifrelendiği için parolayı açabilen herkes geçmişini de açabilir. Her rekey'de
-geçmiş de yeni DEK'e taşınır, böylece erişimi kaldırılan kişi geçmişi de
-açamaz. Sunucu, geçmişi olan bir kaydın geçmişsiz rekey'ini reddeder. Eski
-parolalar da güncel parola gibi yalnızca panoya kopyalanır. AAD şifreli veriyi sahibine ve kayıt kimliğine bağlar: sunucu bir
+çözülmez. AAD şifreli veriyi sahibine ve kayıt kimliğine bağlar: sunucu bir
 kaydın şifreli verisini başka bir kayda taşırsa çözme başarısız olur.
+
+### Geçmiş
+
+Kayıtta herhangi bir şey (başlık, kullanıcı adı ya da parola) değiştiğinde
+önceki hali `itemHistory` tablosuna yeni bir satır olarak eklenir. Sayı ya da
+boyut sınırı yoktur; her satır ayrı şifrelendiği için tek bir alanın boyut
+sınırına takılmaz.
+
+Geçmiş kaydın DEK'i ile şifreli olduğu için kaydı açabilen herkes (sahip,
+doğrudan yetkililer, departman üyeleri, yöneticiler) geçmişi de açabilir. Her
+rekey'de bütün geçmiş satırları yeni DEK'e taşınır; erişimi kaldırılan kişi
+geçmişi de açamaz. Sunucu rekey'i ancak mevcut her geçmiş satırı tam bir kez
+(yeni DEK ile) ve en fazla bir yeni satırla gönderildiğinde kabul eder; böylece
+geçmiş silinemez ya da değiştirilemez. Eski parolalar da güncel parola gibi
+yalnızca panoya kopyalanır.
 
 Kayıt kimliği (`item-<32 hex>`) istemcide rastgele üretilir. Bu sayede
 çevrimdışı oluşturulan kayıtlar çakışmadan gönderilebilir ve aynı kayıt
@@ -220,16 +229,21 @@ paketlenir:
 
 Yöneticilerin her departmanın anahtarını tutması, yeni üyelere ve davet edilen
 kullanıcılara anahtar verilirken kimsenin beklemesini önler: işlemi yapan
-yöneticinin cihazı o anda paketlemeyi yapar. Yöneticiler departman anahtarını
-tutar ama erişim kuralı gereği o departmanın kayıtlarını listelerinde görmez.
+yöneticinin cihazı o anda paketlemeyi yapar.
 
 Bu tasarımın sonuçları:
 
 - Bir kayıt departmanla paylaşıldığında yalnızca tek bir paket üretilir.
   Departmana sonradan katılan kişi de departmanın bütün kayıtlarına erişir ve
   kayıt sahibinin çevrimiçi olması gerekmez.
-- Bir departmanın paylaşılan kayıtlarını **yöneticiler teknik olarak
-  çözebilir**. Kişiye doğrudan paylaşılan ve kişisel kayıtlar bundan etkilenmez.
+
+### Yöneticiler
+
+Yöneticiler **bütün kayıtları** (kişisel olanlar dahil) görür: her kaydın DEK'i
+bütün yöneticilerin açık anahtarına da doğrudan paketlenir. Paketleri, kayda
+doğrudan erişimi olan herhangi bir istemci (genellikle sahibin ya da başka bir
+yöneticinin cihazı) arka planda üretir. Yöneticilikten çıkarılan ya da devre
+dışı bırakılan kişinin paketleri silinir ve kayıtlar yeniden şifrelenir.
 
 ### Arka plan işleri
 

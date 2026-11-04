@@ -6,6 +6,7 @@ import { useEffect, useRef, useState } from "react";
 import { api } from "../convex/_generated/api";
 import type { Id } from "../convex/_generated/dataModel";
 import { errorMessage } from "./errors";
+import type { HistoryRecord } from "./vaultData";
 
 type WrappedKey = { ephemeralPublicKey: string; nonce: string; ciphertext: string };
 type UserAccess = { userId: Id<"users">; access: WrappedKey };
@@ -21,7 +22,6 @@ function toEncryptedItem(item: ServerItem) {
     ownerId: item.ownerId,
     metadata: item.metadata,
     secret: item.secret,
-    history: item.history,
     access: item.access,
   };
 }
@@ -232,11 +232,12 @@ export default function KeySync({ enabled, serverPublicKey, onError }: Props) {
         const rekeyed = await invoke<{
           metadata: ServerItem["metadata"];
           secret: ServerItem["secret"];
-          history: ServerItem["history"];
+          history: HistoryRecord[];
           accesses: UserAccess[];
           departmentAccesses: DepartmentAccess[];
         }>("rekey_item", {
           item: toEncryptedItem(task.item),
+          history: task.history,
           recipients: task.recipients,
           departmentRecipients: task.departments,
         });

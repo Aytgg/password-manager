@@ -28,10 +28,12 @@ export type EncryptedItem = {
   ownerId: string;
   metadata: SealedField;
   secret: SealedField;
-  /** Eski parolalar; parola hiç değişmediyse `null`. */
-  history: SealedField | null;
   access: ServerItem["access"];
 };
+
+/** Kaydın bir önceki hali; Rust tarafındaki `HistoryRecord`. Yeni eklenen
+ * (henüz sunucuya gitmemiş) kayıtta `id` yoktur. */
+export type HistoryRecord = { id?: Id<"itemHistory">; entry: SealedField };
 
 export type Grants = { userIds: Id<"users">[]; departmentIds: Id<"departments">[] };
 
@@ -96,8 +98,6 @@ export function toEncryptedItem(item: ServerItem): EncryptedItem {
     ownerId: item.ownerId,
     metadata: item.metadata,
     secret: item.secret,
-    // Eski sürümün önbelleğindeki kayıtlarda alan yoktur.
-    history: item.history ?? null,
     access: item.access,
   };
 }
@@ -267,7 +267,6 @@ export function useVaultData({ ownerId, isOnline }: { ownerId: string | null; is
             ownerId,
             metadata: op.item.metadata,
             secret: op.item.secret,
-            history: null,
             access: { kind: "direct", access: op.item.ownerAccess },
           },
           grants: { userIds: [], departmentIds: [] },
