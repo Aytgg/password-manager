@@ -977,11 +977,12 @@ function folderTree(folders: Folder[]) {
 
 type FolderTree = ReturnType<typeof folderTree>;
 
-/** Hedef klasör seçimi: kök ve yönetilebilen klasörler, tam yolu ile. */
+/** Hedef klasör seçimi: kök ve klasörler, tam yolu ile. */
 function FolderSelect({
   tree,
   value,
   exclude,
+  onlyManageable = false,
   disabled,
   label,
   onChange,
@@ -989,12 +990,14 @@ function FolderSelect({
   tree: FolderTree;
   value: Id<"folders"> | null;
   exclude?: Set<Id<"folders">>;
+  /** Klasör taşırken yalnızca düzenlenebilen klasörler hedef olabilir. */
+  onlyManageable?: boolean;
   disabled?: boolean;
   label: string;
   onChange: (folderId: Id<"folders"> | null) => void;
 }) {
   const options = [...tree.byId.values()]
-    .filter((folder) => folder.canManage && !exclude?.has(folder.id))
+    .filter((folder) => (!onlyManageable || folder.canManage) && !exclude?.has(folder.id))
     .map((folder) => ({ id: folder.id, text: tree.pathText(folder.id) }))
     .sort((a, b) => a.text.localeCompare(b.text, "tr"));
 
@@ -1138,7 +1141,10 @@ function FolderDetail({
       </dl>
 
       {!folder.canManage ? (
-        <p style={styles.muted}>Bu klasörü yalnızca sahibi ya da bir yönetici düzenleyebilir.</p>
+        <p style={styles.muted}>
+          Bu klasörü yalnızca oluşturan departman yöneticisi ya da bir yönetici düzenleyebilir.
+          Kendi parolalarını bu klasöre koyabilirsin.
+        </p>
       ) : (
         <div style={{ display: "grid", gap: 18, borderTop: "1px solid #27272a", paddingTop: 16 }}>
           {!isOnline && <p style={{ ...styles.muted, margin: 0 }}>Klasör işlemleri için bağlantı gerekli.</p>}
@@ -1177,6 +1183,7 @@ function FolderDetail({
               tree={tree}
               value={folder.parentId}
               exclude={tree.descendants(folder.id)}
+              onlyManageable
               disabled={!editable || busy}
               label="Klasörün taşınacağı yer"
               onChange={(parentId) =>
@@ -1362,6 +1369,9 @@ function NewItemForm({
 
 export default function PasswordManager({ data, isOnline }: PasswordManagerProps) {
   const pendingSharedCount = useQuery(api.items.pendingSharedCount, isOnline ? {} : "skip");
+  const me = useQuery(api.users.me, isOnline ? {} : "skip");
+  // Klasörleri yalnızca yöneticiler ve departman yöneticileri oluşturur.
+  const canCreateFolders = me?.role === "admin" || me?.role === "manager";
 
   const [metadataByItemId, setMetadataByItemId] = useState<
     Record<string, DecryptedMetadata>
@@ -1449,10 +1459,12 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
     (itemsByFolder.get(id)?.length ?? 0) +
     tree.childrenOf(id).reduce((sum, child) => sum + countInside(child.id), 0);
 
-  // Yeni kayıt ya da klasörün konumu: seçili klasör ya da seçili kaydın
-  // klasörü (yönetilebiliyorsa), yoksa kök.
-  const contextFolderId = selectedFolder?.id ?? selected?.vault.folderId ?? null;
-  const targetFolderId =
+  // Yeni kaydın konumu: seçili klasör ya da seçili kaydın klasörü, yoksa
+  // kök. Yeni klasör yalnızca düzenlenebilen bir klasörün altına açılır.
+  const contextFolderId =
+    (selectedFolder?.id ?? selected?.vault.folderId ?? null) as Id<"folders"> | null;
+  const itemTargetId = contextFolderId && tree.byId.has(contextFolderId) ? contextFolderId : null;
+  const folderTargetId =
     contextFolderId && tree.byId.get(contextFolderId)?.canManage ? contextFolderId : null;
 
   function clearMessages() {
@@ -1650,7 +1662,7 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
             <button
               type="button"
               className="pm-icon-button"
-              title={`Yeni parola (${tree.pathText(targetFolderId)})`}
+              title={`Yeni parola (${tree.pathText(itemTargetId)})`}
               aria-label="Yeni parola"
               onClick={() => {
                 setMode("create");
@@ -1660,21 +1672,21 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
             >
               <Icon>{icons.keyPlus}</Icon>
             </button>
-            <button
-              type="button"
-              className="pm-icon-button"
-              title={
-                isOnline ? `Yeni klasör (${tree.pathText(targetFolderId)})` : "Klasör işlemleri için bağlantı gerekli"
-              }
-              aria-label="Yeni klasör"
-              onClick={() => {
-                setMode("createFolder");
-                clearMessages();
-              }}
-              disabled={!data.loaded || !isOnline}
-            >
-              <Icon>{icons.folderPlus}</Icon>
-            </button>
+            {canCreateFolders && (
+              <button
+                type="button"
+                className="pm-icon-button"
+                title={`Yeni klasör (${tree.pathText(folderTargetId)})`}
+                aria-label="Yeni klasör"
+                onClick={() => {
+                  setMode("createFolder");
+                  clearMessages();
+                }}
+                disabled={!data.loaded || !isOnline}
+              >
+                <Icon>{icons.folderPlus}</Icon>
+              </button>
+            )}
           </div>
         </div>
 
@@ -1753,7 +1765,7 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
             <NewItemForm
               data={data}
               isOnline={isOnline}
-              folderId={targetFolderId}
+              folderId={itemTargetId}
               tree={tree}
               onCreated={(itemId, message) => {
                 setSelectedItemId(itemId);
@@ -1765,7 +1777,7 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
             />
           ) : mode === "createFolder" ? (
             <NewFolderForm
-              parentId={targetFolderId}
+              parentId={folderTargetId}
               tree={tree}
               onCreated={(id, name) => {
                 setSelectedFolderId(id);

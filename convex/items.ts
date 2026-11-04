@@ -6,7 +6,6 @@ import { mutation, query } from "./_generated/server";
 import {
   assertSealedField,
   assertWrappedKey,
-  canManageFolder,
   currentDepartmentKey,
   deleteItem,
   directRecipients,
@@ -263,13 +262,7 @@ export const create = mutation({
     let folderId: Id<"folders"> | undefined;
 
     if (args.folderId) {
-      const folder = await ctx.db.get(args.folderId);
-
-      if (folder && !canManageFolder(user, folder)) {
-        throw new ConvexError("Bu klasöre kayıt ekleme yetkin yok.");
-      }
-
-      folderId = folder?._id;
+      folderId = (await ctx.db.get(args.folderId))?._id;
     }
 
     const now = Date.now();
@@ -298,7 +291,7 @@ export const create = mutation({
 
 /**
  * Kaydı bir klasöre ya da köke (`folderId: null`) taşır. Kaydın sahibi ya da
- * bir yönetici yapabilir; hedef klasörü de yönetebiliyor olmalıdır.
+ * bir yönetici yapabilir; klasörler herkese açıktır.
  */
 export const move = mutation({
   args: { id: v.id("items"), folderId: v.union(v.id("folders"), v.null()) },
@@ -310,12 +303,8 @@ export const move = mutation({
       throw new ConvexError("Parola bulunamadı ya da taşıma yetkin yok.");
     }
 
-    if (args.folderId) {
-      const folder = await ctx.db.get(args.folderId);
-
-      if (!folder || !canManageFolder(user, folder)) {
-        throw new ConvexError("Klasör bulunamadı ya da yönetme yetkin yok.");
-      }
+    if (args.folderId && !(await ctx.db.get(args.folderId))) {
+      throw new ConvexError("Klasör bulunamadı.");
     }
 
     await ctx.db.patch(item._id, { folderId: args.folderId ?? undefined, updatedAt: Date.now() });

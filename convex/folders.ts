@@ -3,7 +3,7 @@ import { ConvexError, v } from "convex/values";
 import type { Doc, Id } from "./_generated/dataModel";
 import type { QueryCtx } from "./_generated/server";
 import { mutation, query } from "./_generated/server";
-import { accessibleItemIds, canManageFolder, requireActiveUser } from "./lib";
+import { canCreateFolders, canManageFolder, requireActiveUser } from "./lib";
 
 const MAX_NAME_LENGTH = 100;
 const MAX_DEPTH = 20;
@@ -75,46 +75,22 @@ async function requireUniqueName(
 }
 
 /**
- * Kullanıcının görebildiği klasörler: kendi oluşturdukları ve içinde
- * (alt klasörler dahil) açabildiği bir kayıt bulunanlar. Yöneticiler bütün
- * klasörleri görür.
+ * Klasör ağacı şirket geneli: herkes bütün klasörleri görür ve kendi
+ * kayıtlarını istediği klasöre koyabilir. Klasörleri yalnızca yöneticiler ve
+ * departman yöneticileri oluşturup düzenler.
  */
 export const list = query({
   args: {},
   handler: async (ctx) => {
     const user = await requireActiveUser(ctx);
     const all = await ctx.db.query("folders").collect();
-    const byId = new Map(all.map((folder) => [folder._id, folder]));
-    const visible = new Set<Id<"folders">>();
+    const ids = new Set(all.map((folder) => folder._id));
 
-    const addWithAncestors = (id: Id<"folders"> | undefined) => {
-      let current = id ? byId.get(id) : undefined;
-
-      while (current && !visible.has(current._id)) {
-        visible.add(current._id);
-        current = current.parentId ? byId.get(current.parentId) : undefined;
-      }
-    };
-
-    if (user.role === "admin") {
-      all.forEach((folder) => visible.add(folder._id));
-    } else {
-      all
-        .filter((folder) => folder.ownerId === user._id)
-        .forEach((folder) => addWithAncestors(folder._id));
-
-      for (const itemId of await accessibleItemIds(ctx, user)) {
-        addWithAncestors((await ctx.db.get(itemId))?.folderId);
-      }
-    }
-
-    return [...visible]
-      .map((id) => byId.get(id)!)
+    return all
       .map((folder) => ({
         id: folder._id,
         name: folder.name,
-        // Görünmeyen bir üst klasör olamaz; yine de olursa kökte gösterilir.
-        parentId: folder.parentId && visible.has(folder.parentId) ? folder.parentId : null,
+        parentId: folder.parentId && ids.has(folder.parentId) ? folder.parentId : null,
         isOwner: folder.ownerId === user._id,
         canManage: canManageFolder(user, folder),
       }))
@@ -127,6 +103,10 @@ export const create = mutation({
   handler: async (ctx, args) => {
     const user = await requireActiveUser(ctx);
     const name = folderName(args.name);
+
+    if (!canCreateFolders(user)) {
+      throw new ConvexError("Klasörleri yalnızca yöneticiler ve departman yöneticileri oluşturabilir.");
+    }
 
     if (args.parentId) {
       const parent = await requireManagedFolder(ctx, user, args.parentId);
