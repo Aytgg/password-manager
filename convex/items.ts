@@ -7,6 +7,7 @@ import {
   assertSealedField,
   assertWrappedKey,
   currentDepartmentKey,
+  deleteItem,
   directRecipients,
   itemGrants,
   removeDisallowedAccess,
@@ -287,16 +288,7 @@ export const remove = mutation({
     const user = await requireActiveUser(ctx);
     const item = await requireOwnedItem(ctx, user._id, args.id);
 
-    for (const table of ["itemAccess", "itemDepartmentAccess", "itemGrants", "itemHistory"] as const) {
-      for (const row of await ctx.db
-        .query(table)
-        .withIndex("by_item", (q) => q.eq("item", item._id))
-        .collect()) {
-        await ctx.db.delete(row._id);
-      }
-    }
-
-    await ctx.db.delete(item._id);
+    await deleteItem(ctx, item._id);
   },
 });
 
@@ -418,6 +410,12 @@ export const setUserGrant = mutation({
 
     if (args.userId === item.ownerId) {
       throw new ConvexError("Parola sahibinin erişimi değiştirilemez.");
+    }
+
+    const target = await ctx.db.get(args.userId);
+
+    if (args.granted && target?.role === "admin") {
+      throw new ConvexError("Yöneticiler zaten bütün parolalara erişir.");
     }
 
     const existing = (

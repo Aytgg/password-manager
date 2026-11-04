@@ -428,21 +428,6 @@ pub fn history_summary(
     Ok(result)
 }
 
-/// Bir geçmiş kaydındaki parolayı çözer.
-pub fn decrypt_history_password(
-    identity: &IdentityKeyPair,
-    item: &EncryptedItem,
-    record: &HistoryRecord,
-) -> Result<Zeroizing<Vec<u8>>, String> {
-    let dek = unwrap_item_dek(identity, item)?;
-    let entry = open_history_entry(record, &dek, &history_aad(&item.owner_id, &item.item_id))?;
-
-    BASE64
-        .decode(&entry.password)
-        .map(Zeroizing::new)
-        .map_err(|_| "Parola geçmişi okunamadı.".to_string())
-}
-
 pub fn decrypt_secret(
     identity: &IdentityKeyPair,
     item: &EncryptedItem,
@@ -903,9 +888,6 @@ mod tests {
                 ("VPN", Some("ali"), true, false, false),
             ]
         );
-
-        let oldest = history.iter().find(|r| r.id.as_deref() == Some(&summary[1].id)).unwrap();
-        assert_eq!(decrypt_history_password(&recipient, &as_recipient, oldest).unwrap().as_slice(), b"pw1");
 
         // Erişimi kaldırılan kişinin eski DEK'i geçmişi açamaz.
         let as_removed = EncryptedItem {

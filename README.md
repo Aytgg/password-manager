@@ -178,8 +178,9 @@ doğrudan yetkililer, departman üyeleri, yöneticiler) geçmişi de açabilir. 
 rekey'de bütün geçmiş satırları yeni DEK'e taşınır; erişimi kaldırılan kişi
 geçmişi de açamaz. Sunucu rekey'i ancak mevcut her geçmiş satırı tam bir kez
 (yeni DEK ile) ve en fazla bir yeni satırla gönderildiğinde kabul eder; böylece
-geçmiş silinemez ya da değiştirilemez. Eski parolalar da güncel parola gibi
-yalnızca panoya kopyalanır.
+geçmiş silinemez ya da değiştirilemez. Arayüz eski başlığı, kullanıcı adını
+ve neyin değiştiğini gösterir; eski parolalar gösterilmez ve kopyalanamaz
+(yalnızca "parola değişti" bilgisi için saklanır).
 
 Kayıt kimliği (`item-<32 hex>`) istemcide rastgele üretilir. Bu sayede
 çevrimdışı oluşturulan kayıtlar çakışmadan gönderilebilir ve aynı kayıt
@@ -244,6 +245,14 @@ bütün yöneticilerin açık anahtarına da doğrudan paketlenir. Paketleri, ka
 doğrudan erişimi olan herhangi bir istemci (genellikle sahibin ya da başka bir
 yöneticinin cihazı) arka planda üretir. Yöneticilikten çıkarılan ya da devre
 dışı bırakılan kişinin paketleri silinir ve kayıtlar yeniden şifrelenir.
+
+### Departman silme
+
+Departman silinirken departmandaki her kullanıcı için ya başka bir departmana
+taşıma ya da kullanıcıyı silme seçilir (herkese tek seçimle de uygulanabilir).
+Taşınan kullanıcının eski departman anahtarı kaldırılır. Silinen kullanıcının
+oturumları, giriş hesabı, anahtar paketleri ve **kendi parolaları** silinir.
+Departmanla yapılan paylaşımlar kalkar ve o kayıtlar yeniden şifrelenir.
 
 ### Arka plan işleri
 

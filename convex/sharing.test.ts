@@ -1006,4 +1006,90 @@ describe("kullanıcı yönetimi", () => {
       as("manager").mutation(api.departments.create, { name: "Destek" }),
     ).rejects.toThrow(/yalnızca yönetici/);
   });
+
+  test("departman adı değiştirilir; aynı isim ve yönetici olmayan reddedilir", async () => {
+    const { ids, as, getDepartment } = await setup();
+
+    await as("admin").mutation(api.departments.rename, { id: ids.yazilim, name: " Ar-Ge " });
+    expect((await getDepartment(ids.yazilim))!.name).toBe("Ar-Ge");
+
+    await expect(
+      as("admin").mutation(api.departments.rename, { id: ids.satis, name: "Ar-Ge" }),
+    ).rejects.toThrow(/zaten var/);
+    await expect(
+      as("manager").mutation(api.departments.rename, { id: ids.satis, name: "X" }),
+    ).rejects.toThrow(/yalnızca yönetici/);
+  });
+
+  test("departman silinirken üyeler taşınır ya da silinir, paylaşımlar kalkar", async () => {
+    const {
+      t, ids, uid, as, runDepartmentWork, runItemWork, createItem, shareWithDepartment,
+      getItem, getDepartment, departmentKeyNames,
+    } = await setup();
+    await runDepartmentWork();
+
+    const carolItem = await createItem("carol");
+    await shareWithDepartment("carol", carolItem, ids.yazilim);
+    const bobItem = await createItem("bob");
+    await runItemWork("bob");
+
+    // Liste eksik ya da fazla olamaz.
+    await expect(
+      as("admin").mutation(api.departments.remove, {
+        id: ids.yazilim,
+        assignments: [{ userId: uid("alice"), action: "move", departmentId: ids.satis }],
+      }),
+    ).rejects.toThrow(/kullanıcılar değişti/);
+    await expect(
+      as("admin").mutation(api.departments.remove, {
+        id: ids.yazilim,
+        assignments: [
+          { userId: uid("alice"), action: "move", departmentId: ids.yazilim },
+          { userId: uid("bob"), action: "delete" },
+        ],
+      }),
+    ).rejects.toThrow(/geçersiz/);
+    await expect(
+      as("manager").mutation(api.departments.remove, { id: ids.yazilim, assignments: [] }),
+    ).rejects.toThrow(/yalnızca yönetici/);
+
+    await as("admin").mutation(api.departments.remove, {
+      id: ids.yazilim,
+      assignments: [
+        { userId: uid("alice"), action: "move", departmentId: ids.satis },
+        { userId: uid("bob"), action: "delete" },
+      ],
+    });
+
+    expect(await getDepartment(ids.yazilim)).toBeNull();
+    expect(await departmentKeyNames(ids.yazilim)).toEqual([]);
+
+    // Alice Satış'a taşındı; Bob ve kendi kaydı silindi.
+    expect(await t.run((ctx) => ctx.db.get(uid("alice")))).toMatchObject({ departmentId: ids.satis });
+    expect(await t.run((ctx) => ctx.db.get(uid("bob")))).toBeNull();
+    expect(await getItem(bobItem)).toBeNull();
+    expect(
+      await t.run((ctx) =>
+        ctx.db
+          .query("itemAccess")
+          .withIndex("by_user", (q) => q.eq("userId", uid("bob")))
+          .collect(),
+      ),
+    ).toEqual([]);
+
+    // Departmanla paylaşım kalktı ve kayıt yeniden şifrelenecek.
+    expect((await as("carol").query(api.items.sharing, { id: carolItem })).departments).toEqual([
+      { id: ids.satis, name: "Satış", granted: false },
+    ]);
+    expect((await getItem(carolItem))!.needsRekey).toBe(true);
+  });
+
+  test("yöneticiye doğrudan paylaşım verilemez; erişimi zaten açıktır", async () => {
+    const { uid, as, createItem } = await setup();
+    const id = await createItem("alice");
+
+    await expect(
+      as("alice").mutation(api.items.setUserGrant, { id, userId: uid("admin"), granted: true }),
+    ).rejects.toThrow(/zaten bütün parolalara/);
+  });
 });

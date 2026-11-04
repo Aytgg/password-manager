@@ -84,6 +84,171 @@ const styles: Record<string, React.CSSProperties> = {
   success: { color: "#4ade80", overflowWrap: "anywhere" },
 };
 
+type Department = FunctionReturnType<typeof api.departments.list>[number];
+type Member = FunctionReturnType<typeof api.members.list>[number];
+
+/** Departmandaki bir kullanıcı için seçilen işlem: `move:<departmanId>` ya da `delete`. */
+type Choice = string;
+
+function choiceLabel(member: Member) {
+  return member.ownedItemCount > 0
+    ? `Kullanıcıyı sil (kendi ${member.ownedItemCount} parolası da silinir)`
+    : "Kullanıcıyı sil";
+}
+
+/**
+ * Departman silme: departmandaki her kullanıcı için başka bir departmana
+ * taşıma ya da silme seçilir. Herkese aynı işlem tek seçimle de uygulanabilir.
+ */
+function DeleteDepartmentPanel({
+  department,
+  departments,
+  members,
+  busy,
+  onCancel,
+  onConfirm,
+}: {
+  department: Department;
+  departments: Department[];
+  members: Member[];
+  busy: boolean;
+  onCancel: () => void;
+  onConfirm: (
+    assignments: (
+      | { userId: Id<"users">; action: "move"; departmentId: Id<"departments"> }
+      | { userId: Id<"users">; action: "delete" }
+    )[],
+  ) => void;
+}) {
+  const targets = departments.filter((candidate) => candidate.id !== department.id);
+  const [choices, setChoices] = useState<Record<string, Choice>>({});
+
+  const options = (member: Member | null) => (
+    <>
+      <option value="">İşlem seç</option>
+      {targets.map((target) => (
+        <option key={target.id} value={`move:${target.id}`}>
+          {target.name} departmanına taşı
+        </option>
+      ))}
+      {(member === null || !member.isSelf) && (
+        <option value="delete">{member ? choiceLabel(member) : "Kullanıcıları sil"}</option>
+      )}
+    </>
+  );
+
+  const applyToAll = (choice: Choice) =>
+    setChoices(
+      Object.fromEntries(
+        members.map((member) => [
+          member.id,
+          choice === "delete" && member.isSelf ? (choices[member.id] ?? "") : choice,
+        ]),
+      ),
+    );
+
+  const complete = members.every((member) => (choices[member.id] ?? "") !== "");
+  const deleting = members.filter((member) => choices[member.id] === "delete");
+
+  return (
+    <div
+      style={{
+        marginTop: 12,
+        padding: 14,
+        border: "1px solid #5b2b2b",
+        borderRadius: 10,
+        background: "#1f1416",
+      }}
+    >
+      <strong>{department.name} departmanını sil</strong>
+
+      {members.length === 0 ? (
+        <p style={styles.muted}>Bu departmanda kullanıcı yok.</p>
+      ) : (
+        <>
+          <p style={styles.muted}>
+            Bu departmana bağlı {members.length} kullanıcı var. Her biri için ne yapılacağını seç.
+          </p>
+
+          <div style={{ ...styles.row, marginBottom: 12 }}>
+            <span style={styles.muted}>Herkese uygula:</span>
+            <select
+              style={styles.input}
+              value=""
+              onChange={(event) => event.target.value && applyToAll(event.target.value)}
+              aria-label="Bütün kullanıcılara aynı işlemi uygula"
+              disabled={busy}
+            >
+              {options(null)}
+            </select>
+          </div>
+
+          <div style={{ display: "grid", gap: 8 }}>
+            {members.map((member) => (
+              <div key={member.id} style={{ ...styles.row, justifyContent: "space-between" }}>
+                <span style={{ overflowWrap: "anywhere" }}>
+                  {member.displayName ?? member.email}
+                  {member.isSelf && " (sen)"}
+                  <span style={{ ...styles.muted, marginLeft: 8 }}>{member.email}</span>
+                </span>
+                <select
+                  style={styles.input}
+                  value={choices[member.id] ?? ""}
+                  onChange={(event) =>
+                    setChoices((current) => ({ ...current, [member.id]: event.target.value }))
+                  }
+                  aria-label={`${member.email} için işlem`}
+                  disabled={busy}
+                >
+                  {options(member)}
+                </select>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
+
+      {deleting.length > 0 && (
+        <p style={{ ...styles.error, fontSize: 13 }}>
+          {deleting.length} kullanıcı ve kendi parolaları kalıcı olarak silinecek.
+        </p>
+      )}
+
+      <p style={styles.muted}>
+        Departmanla yapılan paylaşımlar kalkar; o parolalar sahiplerinin cihazında yeniden
+        şifrelenir.
+      </p>
+
+      <div style={styles.row}>
+        <button
+          type="button"
+          style={{ ...styles.button, background: "#dc2626", opacity: complete ? 1 : 0.5 }}
+          disabled={busy || !complete}
+          onClick={() =>
+            onConfirm(
+              members.map((member) => {
+                const choice = choices[member.id];
+                return choice === "delete"
+                  ? { userId: member.id, action: "delete" as const }
+                  : {
+                      userId: member.id,
+                      action: "move" as const,
+                      departmentId: choice.slice("move:".length) as Id<"departments">,
+                    };
+              }),
+            )
+          }
+        >
+          Departmanı sil
+        </button>
+        <button type="button" style={styles.secondaryButton} disabled={busy} onClick={onCancel}>
+          Vazgeç
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export default function AdminPanel({ me }: { me: Me }) {
   const isAdmin = me.role === "admin";
 
@@ -92,11 +257,20 @@ export default function AdminPanel({ me }: { me: Me }) {
 
   const createDepartment = useMutation(api.departments.create);
   const createDefaultDepartments = useMutation(api.departments.createDefaults);
+  const renameDepartment = useMutation(api.departments.rename);
+  const removeDepartment = useMutation(api.departments.remove);
   const inviteMember = useMutation(api.members.invite);
   const renewInvite = useMutation(api.members.renewInvite);
   const updateMember = useMutation(api.members.update);
 
   const [departmentName, setDepartmentName] = useState("");
+  const [editingDepartment, setEditingDepartment] = useState<{
+    id: Id<"departments">;
+    mode: "rename" | "delete";
+    name: string;
+  } | null>(null);
+  // "" bütün kullanıcılar, "none" departmansızlar.
+  const [departmentFilter, setDepartmentFilter] = useState("");
   const [inviteEmail, setInviteEmail] = useState("");
   const [inviteRole, setInviteRole] = useState<Role>("member");
   const [inviteDepartmentId, setInviteDepartmentId] = useState<string>(
@@ -162,18 +336,111 @@ export default function AdminPanel({ me }: { me: Me }) {
               Kullanıcı davet etmeden önce departmanları oluştur.
             </p>
           ) : (
-            <div style={{ ...styles.row, marginBottom: 16 }}>
-              {departments.map((department) => (
-                <span
-                  key={department.id}
-                  style={{
-                    ...styles.secondaryButton,
-                    cursor: "default",
-                  }}
-                >
-                  {department.name}
-                </span>
-              ))}
+            <div style={{ display: "grid", gap: 8, marginBottom: 16 }}>
+              {departments.map((department) => {
+                const editing =
+                  editingDepartment?.id === department.id ? editingDepartment : null;
+                const memberCount =
+                  members?.filter((member) => member.departmentId === department.id).length ?? 0;
+
+                return (
+                  <div
+                    key={department.id}
+                    style={{ paddingBottom: 8, borderBottom: "1px solid #292d36" }}
+                  >
+                    {editing?.mode === "rename" ? (
+                      <form
+                        style={styles.row}
+                        onSubmit={(event) => {
+                          event.preventDefault();
+                          void run(async () => {
+                            await renameDepartment({ id: department.id, name: editing.name });
+                            setEditingDepartment(null);
+                          }, "Departman adı güncellendi.");
+                        }}
+                      >
+                        <input
+                          style={{ ...styles.input, flex: 1 }}
+                          value={editing.name}
+                          onChange={(event) =>
+                            setEditingDepartment({ ...editing, name: event.target.value })
+                          }
+                          aria-label={`${department.name} için yeni ad`}
+                          maxLength={60}
+                          required
+                          autoFocus
+                        />
+                        <button type="submit" style={styles.button} disabled={busy}>
+                          Kaydet
+                        </button>
+                        <button
+                          type="button"
+                          style={styles.secondaryButton}
+                          disabled={busy}
+                          onClick={() => setEditingDepartment(null)}
+                        >
+                          Vazgeç
+                        </button>
+                      </form>
+                    ) : (
+                      <div style={{ ...styles.row, justifyContent: "space-between" }}>
+                        <span>
+                          {department.name}
+                          <span style={{ ...styles.muted, marginLeft: 8 }}>
+                            {memberCount} kullanıcı
+                          </span>
+                        </span>
+                        <div style={styles.row}>
+                          <button
+                            type="button"
+                            style={styles.secondaryButton}
+                            disabled={busy}
+                            onClick={() =>
+                              setEditingDepartment({
+                                id: department.id,
+                                mode: "rename",
+                                name: department.name,
+                              })
+                            }
+                          >
+                            Yeniden adlandır
+                          </button>
+                          <button
+                            type="button"
+                            style={styles.secondaryButton}
+                            disabled={busy || members === undefined}
+                            onClick={() =>
+                              setEditingDepartment(
+                                editing?.mode === "delete"
+                                  ? null
+                                  : { id: department.id, mode: "delete", name: department.name },
+                              )
+                            }
+                          >
+                            Sil
+                          </button>
+                        </div>
+                      </div>
+                    )}
+
+                    {editing?.mode === "delete" && members !== undefined && (
+                      <DeleteDepartmentPanel
+                        department={department}
+                        departments={departments}
+                        members={members.filter((member) => member.departmentId === department.id)}
+                        busy={busy}
+                        onCancel={() => setEditingDepartment(null)}
+                        onConfirm={(assignments) =>
+                          void run(async () => {
+                            await removeDepartment({ id: department.id, assignments });
+                            setEditingDepartment(null);
+                          }, `${department.name} departmanı silindi.`)
+                        }
+                      />
+                    )}
+                  </div>
+                );
+              })}
             </div>
           )}
 
@@ -352,11 +619,39 @@ export default function AdminPanel({ me }: { me: Me }) {
           </div>
         )}
 
+        {(departments?.length ?? 0) > 0 && (
+          <div style={{ ...styles.row, marginBottom: 12 }}>
+            <span style={styles.muted}>Departman:</span>
+            <select
+              style={styles.input}
+              value={departmentFilter}
+              onChange={(event) => setDepartmentFilter(event.target.value)}
+              aria-label="Kullanıcıları departmana göre filtrele"
+            >
+              <option value="">Tümü</option>
+              {departments?.map((department) => (
+                <option key={department.id} value={department.id}>
+                  {department.name}
+                </option>
+              ))}
+              <option value="none">Departmanı olmayanlar</option>
+            </select>
+          </div>
+        )}
+
         {members === undefined ? (
           <p style={styles.muted}>Yükleniyor...</p>
         ) : (
           <div style={{ display: "grid", gap: 10 }}>
-            {members.map((member) => (
+            {members
+              .filter((member) =>
+                departmentFilter === ""
+                  ? true
+                  : departmentFilter === "none"
+                    ? member.departmentId === null
+                    : member.departmentId === departmentFilter,
+              )
+              .map((member) => (
               <div
                 key={member.id}
                 style={{

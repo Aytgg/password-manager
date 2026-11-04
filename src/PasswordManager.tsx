@@ -263,7 +263,7 @@ function SharingPanel({
           const viaAdmin = user.isAdmin === true;
           const allowed = direct || viaDepartment || viaAdmin;
           const hasKey = keyStatus.get(user.userId);
-          const route = direct ? "" : viaDepartment ? "Departman üzerinden " : viaAdmin ? "Yönetici olarak " : "";
+          const route = viaAdmin ? "Yönetici olarak " : direct ? "" : viaDepartment ? "Departman üzerinden " : "";
 
           const access = !allowed
             ? "Erişim kapalı"
@@ -308,8 +308,8 @@ function SharingPanel({
               </div>
 
               <Toggle
-                checked={direct}
-                disabled={false}
+                checked={direct || viaAdmin}
+                disabled={viaAdmin}
                 label={`${user.displayName} için doğrudan parola erişimi`}
                 onChange={(granted) => toggle({ kind: "user", userId: user.userId }, granted)}
               />
@@ -350,13 +350,12 @@ function describeChange(entry: HistoryInfo) {
 
 /**
  * Kaydın önceki halleri; kaydı açabilen herkes görür. Geçmiş sunucudan
- * istenir (çevrimiçi). Başlık ve kullanıcı adı gösterilir; eski parolalar
- * güncel parola gibi yalnızca panoya kopyalanır (açık metin React'e gelmez).
+ * istenir (çevrimiçi). Başlık, kullanıcı adı ve neyin değiştiği gösterilir;
+ * eski parolalar gösterilmez.
  */
-function PasswordHistoryPanel({ id, onCopied }: { id: Id<"items">; onCopied: () => void }) {
+function PasswordHistoryPanel({ id }: { id: Id<"items"> }) {
   const server = useQuery(api.items.history, { id });
   const [entries, setEntries] = useState<HistoryInfo[] | null>(null);
-  const [copyingId, setCopyingId] = useState<string | null>(null);
   const [error, setError] = useState("");
 
   useEffect(() => {
@@ -382,27 +381,6 @@ function PasswordHistoryPanel({ id, onCopied }: { id: Id<"items">; onCopied: () 
       cancelled = true;
     };
   }, [server]);
-
-  async function handleCopy(entryId: Id<"itemHistory">) {
-    const record = server?.history.find((candidate) => candidate.id === entryId);
-
-    if (!server || !record || copyingId !== null) return;
-
-    setCopyingId(entryId);
-    setError("");
-
-    try {
-      await invoke("copy_item_history_password_to_clipboard", {
-        item: toEncryptedItem(server.item),
-        record,
-      });
-      onCopied();
-    } catch (err) {
-      setError(errorMessage(err));
-    } finally {
-      setCopyingId(null);
-    }
-  }
 
   return (
     <div>
@@ -443,18 +421,6 @@ function PasswordHistoryPanel({ id, onCopied }: { id: Id<"items">; onCopied: () 
                 </div>
               </div>
 
-              <button
-                type="button"
-                style={{
-                  ...styles.secondaryButton,
-                  opacity: copyingId !== null ? 0.6 : 1,
-                  cursor: copyingId !== null ? "wait" : "pointer",
-                }}
-                onClick={() => void handleCopy(entry.id)}
-                disabled={copyingId !== null}
-              >
-                {copyingId === entry.id ? "Kopyalanıyor..." : "O zamanki parolayı kopyala"}
-              </button>
             </div>
           ))}
         </div>
@@ -1096,15 +1062,7 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
                       borderTop: "1px solid #353b48",
                     }}
                   >
-                    <PasswordHistoryPanel
-                      id={id}
-                      onCopied={() => {
-                        setError("");
-                        setSuccess(
-                          "Eski parola panoya kopyalandı. 30 saniye sonra otomatik temizlenmesi denenecek.",
-                        );
-                      }}
-                    />
+                    <PasswordHistoryPanel id={id} />
                   </div>
                 )}
 

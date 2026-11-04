@@ -521,21 +521,6 @@ fn item_password_history(
     session.with_identity(|identity, _| items::history_summary(identity, &item, &history))
 }
 
-/// Geçmişteki bir parolayı Rust tarafında çözer ve panoya yazar.
-#[tauri::command]
-fn copy_item_history_password_to_clipboard(
-    app: tauri::AppHandle,
-    session: tauri::State<'_, Arc<VaultSession>>,
-    item: EncryptedItem,
-    record: items::HistoryRecord,
-) -> Result<(), String> {
-    let plaintext_bytes = session.with_identity(|identity, _| {
-        items::decrypt_history_password(identity, &item, &record)
-    })?;
-
-    copy_secret_to_clipboard(app, plaintext_bytes)
-}
-
 fn copy_secret_to_clipboard(
     app: tauri::AppHandle,
     plaintext_bytes: Zeroizing<Vec<u8>>,
@@ -736,7 +721,6 @@ pub fn run() {
             decrypt_items_metadata,
             copy_item_password_to_clipboard,
             item_password_history,
-            copy_item_history_password_to_clipboard,
             wrap_item_key_for_recipient,
             rekey_item,
             edit_item,
