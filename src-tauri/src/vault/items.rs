@@ -318,14 +318,6 @@ fn validate_secret(secret: &[u8]) -> Result<(), String> {
     Ok(())
 }
 
-fn require_owner(owner_id: &str, item: &EncryptedItem) -> Result<(), String> {
-    if item.owner_id != owner_id {
-        return Err("Bu işlem yalnızca parolanın sahibi tarafından yapılabilir.".to_string());
-    }
-
-    Ok(())
-}
-
 pub fn encrypt_new_item(
     identity: &IdentityKeyPair,
     owner_id: &str,
@@ -461,13 +453,13 @@ pub fn wrap_for_recipient(
 /// Listede olmayanların elindeki eski DEK yeni veriyi açamaz.
 pub fn rekey(
     identity: &IdentityKeyPair,
-    owner_id: &str,
+    self_id: &str,
     item: &EncryptedItem,
     history: &[HistoryRecord],
     recipients: &[Recipient],
     departments: &[DepartmentRecipient],
 ) -> Result<RekeyedItem, String> {
-    reencrypt(identity, owner_id, item, history, recipients, departments, None)
+    reencrypt(identity, self_id, item, history, recipients, departments, None)
 }
 
 /// Kayıtta yapılacak değişiklik. `password` boşsa mevcut parola korunur.
@@ -482,27 +474,27 @@ pub struct ItemChanges<'a> {
 /// eski DEK yeni parolayı açamaz.
 pub fn edit(
     identity: &IdentityKeyPair,
-    owner_id: &str,
+    self_id: &str,
     item: &EncryptedItem,
     history: &[HistoryRecord],
     recipients: &[Recipient],
     departments: &[DepartmentRecipient],
     changes: &ItemChanges,
 ) -> Result<RekeyedItem, String> {
-    reencrypt(identity, owner_id, item, history, recipients, departments, Some(changes))
+    reencrypt(identity, self_id, item, history, recipients, departments, Some(changes))
 }
 
 fn reencrypt(
     identity: &IdentityKeyPair,
-    owner_id: &str,
+    self_id: &str,
     item: &EncryptedItem,
     history: &[HistoryRecord],
     recipients: &[Recipient],
     departments: &[DepartmentRecipient],
     changes: Option<&ItemChanges>,
 ) -> Result<RekeyedItem, String> {
-    require_owner(owner_id, item)?;
-
+    // Kimin yeniden şifreleyebileceğine (sahip, düzenleme yetkisi olan,
+    // yönetici) sunucu karar verir; burada yalnızca DEK'i açabilmek gerekir.
     let old_dek = unwrap_item_dek(identity, item)?;
     let metadata_aad = metadata_aad(&item.owner_id, &item.item_id);
     let secret_aad = secret_aad(&item.owner_id, &item.item_id);
@@ -567,13 +559,20 @@ fn reencrypt(
 
     let new_dek = password_encryption::generate_dek();
 
-    let mut accesses = vec![RecipientAccess {
-        user_id: owner_id.to_string(),
-        access: wrap_for(&new_dek, &identity.public_key())?,
-    }];
+    // Çağıranın kendi paketi, kaydın sahibiyse ya da doğrudan alıcıysa
+    // eklenir (sunucudaki açık anahtar yerine kendi kimlik anahtarıyla).
+    // Departmanı üzerinden erişen bir düzenleyici departman paketiyle erişir.
+    let mut accesses = Vec::new();
+
+    if item.owner_id == self_id || recipients.iter().any(|r| r.user_id == self_id) {
+        accesses.push(RecipientAccess {
+            user_id: self_id.to_string(),
+            access: wrap_for(&new_dek, &identity.public_key())?,
+        });
+    }
 
     for recipient in recipients {
-        if recipient.user_id == owner_id
+        if recipient.user_id == self_id
             || accesses.iter().any(|existing| existing.user_id == recipient.user_id)
         {
             continue;
@@ -667,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn non_owner_cannot_rekey() {
+    fn stranger_without_the_key_cannot_rekey() {
         let owner = IdentityKeyPair::generate();
         let other = IdentityKeyPair::generate();
 
@@ -675,6 +674,57 @@ mod tests {
         let item = stored(&new_item, "owner", new_item.owner_access.clone());
 
         assert!(rekey(&other, "other", &item, &[], &[], &[]).is_err());
+    }
+
+    #[test]
+    fn editor_rekeys_for_the_owner_and_keeps_own_access() {
+        let owner = IdentityKeyPair::generate();
+        let editor = IdentityKeyPair::generate();
+        let recipient = |id: &str, identity: &IdentityKeyPair| Recipient {
+            user_id: id.to_string(),
+            public_key: encode_public_key(&identity.public_key()),
+        };
+
+        let new_item = encrypt_new_item(&owner, "owner", "VPN", None, b"pw1").unwrap();
+        let owner_item = stored(&new_item, "owner", new_item.owner_access.clone());
+        let editor_item = EncryptedItem {
+            access: ItemAccess::Direct {
+                access: wrap_for_recipient(&owner, &owner_item, &encode_public_key(&editor.public_key()))
+                    .unwrap(),
+            },
+            ..owner_item.clone()
+        };
+
+        let changes = ItemChanges { title: "VPN", username: None, password: Some(b"pw2") };
+        let edited = edit(
+            &editor,
+            "editor",
+            &editor_item,
+            &[],
+            &[recipient("owner", &owner), recipient("editor", &editor)],
+            &[],
+            &changes,
+        )
+        .unwrap();
+
+        let ids: Vec<_> = edited.accesses.iter().map(|a| a.user_id.as_str()).collect();
+        assert_eq!(ids, ["editor", "owner"]);
+
+        let as_owner = EncryptedItem {
+            metadata: edited.metadata.clone(),
+            secret: edited.secret.clone(),
+            access: ItemAccess::Direct { access: edited.accesses[1].access.clone() },
+            ..owner_item.clone()
+        };
+        assert_eq!(decrypt_secret(&owner, &as_owner).unwrap().as_slice(), b"pw2");
+
+        // Doğrudan alıcı olmayan (departmanı üzerinden erişen) düzenleyiciye
+        // kendi paketi eklenmez.
+        let via_department =
+            edit(&editor, "editor", &editor_item, &[], &[recipient("owner", &owner)], &[], &changes)
+                .unwrap();
+        let ids: Vec<_> = via_department.accesses.iter().map(|a| a.user_id.as_str()).collect();
+        assert_eq!(ids, ["owner"]);
     }
 
     #[test]
@@ -932,13 +982,10 @@ mod tests {
     }
 
     #[test]
-    fn edit_is_owner_only_and_validated() {
+    fn edit_is_validated() {
         let owner = IdentityKeyPair::generate();
         let new_item = encrypt_new_item(&owner, "owner", "A", None, b"pw").unwrap();
         let item = stored(&new_item, "owner", new_item.owner_access.clone());
-
-        let changes = ItemChanges { title: "B", username: None, password: None };
-        assert!(edit(&owner, "other", &item, &[], &[], &[], &changes).is_err());
 
         let empty_title = ItemChanges { title: " ", username: None, password: None };
         assert!(edit(&owner, "owner", &item, &[], &[], &[], &empty_title).is_err());

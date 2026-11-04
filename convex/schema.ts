@@ -109,10 +109,15 @@ export default defineSchema({
     createdAt: v.number(),
   }).index("by_item", ["item"]),
 
+  // Paylaşım kuralı: kişiye ya da departmana. Kuralın varlığı görüntüleme
+  // yetkisidir; diğer yetkiler ayrıca işaretlenir.
   itemGrants: defineTable({
     item: v.id("items"),
     userId: v.optional(v.id("users")),
     departmentId: v.optional(v.id("departments")),
+    canEdit: v.optional(v.boolean()),
+    canDelete: v.optional(v.boolean()),
+    canShare: v.optional(v.boolean()),
   })
     .index("by_item", ["item"])
     .index("by_user", ["userId"])

@@ -8,8 +8,12 @@ import type { Id } from "../convex/_generated/dataModel";
 import { errorMessage } from "./errors";
 import {
   toEncryptedItem,
+  type ExtraPermissions,
   type Folder,
+  grantOf,
   type GrantTarget,
+  NO_EXTRA,
+  type Permissions,
   type HistoryRecord,
   type NewItem,
   type QueuedOp,
@@ -235,27 +239,85 @@ function Chevron({ open, onToggle, label }: { open: boolean; onToggle: () => voi
   );
 }
 
-/** Ağaçta bir düğümün altındaki yetki satırı. Şimdilik tek yetki var. */
-function PermissionRow({
-  checked,
-  disabled,
-  label,
-  title,
+type PermissionKey = "view" | "edit" | "delete" | "share";
+
+const PERMISSION_LABELS: Record<PermissionKey, string> = {
+  view: "Görüntüleme",
+  edit: "Düzenleme",
+  delete: "Silme",
+  share: "Yetkilendirme",
+};
+
+const PERMISSION_KEYS: PermissionKey[] = ["view", "edit", "delete", "share"];
+
+/** Kuralın yetkileri; kural yoksa hepsi kapalı. */
+function asPermissions(extra: ExtraPermissions | null): Permissions {
+  return extra ? { view: true, ...extra } : { view: false, ...NO_EXTRA };
+}
+
+function permissionState(permissions: Permissions): boolean | "mixed" {
+  const on = PERMISSION_KEYS.filter((key) => permissions[key]).length;
+  return on === 0 ? false : on === PERMISSION_KEYS.length ? true : "mixed";
+}
+
+/**
+ * Bir kuralın yetki satırları. Görüntüleme diğerlerinin önkoşuludur: başka
+ * bir yetki açılınca görüntüleme de açılır, görüntüleme kapanınca kural
+ * kalkar. Çağıranda olmayan yetkiler değiştirilemez.
+ */
+function PermissionRows({
+  name,
+  current,
+  actor,
+  locked,
+  inherited,
   onChange,
 }: {
-  checked: boolean;
-  disabled: boolean;
-  label: string;
-  title?: string;
-  onChange: (checked: boolean) => void;
+  name: string;
+  current: Permissions;
+  actor: Permissions;
+  locked?: string;
+  /** Departmandan gelen yetkiler (yalnız bilgi). */
+  inherited?: Permissions | null;
+  onChange: (next: Permissions) => void;
 }) {
   return (
-    <div
-      className="pm-tree-row"
-      style={{ marginLeft: 26, paddingLeft: 12, borderLeft: "1px solid #3f3f46" }}
-    >
-      <Checkbox state={checked} disabled={disabled} label={label} title={title} onChange={onChange} />
-      <span>Yetkilendir</span>
+    <div style={{ marginLeft: 26, paddingLeft: 12, borderLeft: "1px solid #3f3f46" }}>
+      {PERMISSION_KEYS.map((key) => {
+        const allowed = !locked && (key === "view" || actor[key]);
+        const fromDepartment = !current[key] && inherited?.[key];
+
+        return (
+          <div key={key} className="pm-tree-row">
+            <Checkbox
+              state={current[key] ? true : fromDepartment ? "mixed" : false}
+              disabled={!allowed}
+              label={`${name} için ${PERMISSION_LABELS[key]}`}
+              title={
+                locked ??
+                (!allowed
+                  ? "Sende olmayan bir yetkiyi veremezsin"
+                  : fromDepartment
+                    ? "Departmanı üzerinden açık"
+                    : undefined)
+              }
+              onChange={(checked) =>
+                onChange(
+                  key === "view"
+                    ? checked
+                      ? { ...current, view: true }
+                      : { view: false, ...NO_EXTRA }
+                    : { ...current, view: current.view || checked, [key]: checked },
+                )
+              }
+            />
+            <span>{PERMISSION_LABELS[key]}</span>
+            {fromDepartment && (
+              <span style={{ ...styles.muted, fontSize: 11 }}>departmanından</span>
+            )}
+          </div>
+        );
+      })}
     </div>
   );
 }
@@ -265,8 +327,8 @@ type DirectoryUser = Directory["users"][number];
 
 /**
  * Sağ sütun: üstte departmanlar, altta kullanıcılar. Her satırın altında
- * yetki satırı ("Yetkilendir") vardır; satırın kutucuğu bu yetkileri
- * özetler. Yalnızca seçili parolanın sahibi değiştirebilir. Çevrimdışıyken
+ * yetki satırları (görüntüleme, düzenleme, silme, yetkilendirme) vardır; satırın kutucuğu bunları
+ * özetler. Yalnızca yetkilendirme yetkisi olan değiştirebilir. Çevrimdışıyken
  * de değiştirilebilir: değişiklik kuyruğa alınır ve bağlantı gelince
  * gönderilir. Anahtar dağıtımı ve erişim kaldırıldığında yeniden şifreleme
  * arka planda otomatik yapılır.
@@ -283,7 +345,8 @@ function AuthorizationColumn({
   const [search, setSearch] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
-  const editable = item !== null && item.isOwner && data.directory !== null;
+  const editable = item !== null && item.permissions.share && data.directory !== null;
+  const actor = item?.permissions ?? { view: false, ...NO_EXTRA };
 
   // Anahtar durumu (erişim açık mı, hazırlanıyor mu) yalnızca sunucudan
   // öğrenilebilir.
@@ -295,9 +358,25 @@ function AuthorizationColumn({
   const grants = item?.grants ?? { userIds: [], departmentIds: [] };
   const directory = data.directory;
 
-  const toggle = (target: GrantTarget, granted: boolean) => {
-    if (item) data.setGrant(item.itemId, target, granted);
+  const apply = (target: GrantTarget, next: Permissions) => {
+    if (!item) return;
+    if (!next.view) data.setGrant(item.itemId, target, false);
+    else
+      data.setGrant(item.itemId, target, true, {
+        edit: next.edit,
+        delete: next.delete,
+        share: next.share,
+      });
   };
+
+  // Düğüm kutucuğu: hepsini aç (çağıranda olan yetkiler) ya da hepsini kapat.
+  const applyAll = (target: GrantTarget, on: boolean) =>
+    apply(
+      target,
+      on
+        ? { view: true, edit: actor.edit, delete: actor.delete, share: actor.share }
+        : { view: false, ...NO_EXTRA },
+    );
 
   const flip = (key: string) =>
     setExpanded((current) => {
@@ -315,9 +394,9 @@ function AuthorizationColumn({
     });
 
   const message = !item
-    ? "Yetkilendirmek için soldan kendi parolalarından birini seç."
-    : !item.isOwner
-      ? "Bu parola seninle paylaşılmış; yalnızca sahibi yetkilendirebilir."
+    ? "Yetkilendirmek için soldan bir parola seç."
+    : !item.permissions.share
+      ? "Bu parolayı yetkilendirme yetkin yok."
       : !directory
         ? "Kişi ve departman listesi henüz bu cihaza indirilmedi; bir kez çevrimiçi olunca çevrimdışı da yetkilendirme yapabilirsin."
         : null;
@@ -391,7 +470,9 @@ function AuthorizationColumn({
             : departments.length === 0
               ? placeholder("Henüz departman yok.")
               : departments.map((department) => {
-                  const granted = grants.departmentIds.includes(department.id);
+                  const target: GrantTarget = { kind: "department", departmentId: department.id };
+                  const current = asPermissions(grantOf(grants, target));
+                  const granted = current.view;
                   const members = users.filter(
                     (user) => user.isAdmin !== true && user.departmentId === department.id,
                   );
@@ -408,14 +489,12 @@ function AuthorizationColumn({
                           label={`${department.name} yetkileri`}
                         />
                         <Checkbox
-                          state={granted ? true : anyMember ? "mixed" : false}
-                          label={`${department.name} departmanı için yetki`}
+                          state={granted ? permissionState(current) : anyMember ? "mixed" : false}
+                          label={`${department.name} departmanı için bütün yetkiler`}
                           title={
                             !granted && anyMember ? "Bazı üyelerine kişisel yetki verilmiş" : undefined
                           }
-                          onChange={(value) =>
-                            toggle({ kind: "department", departmentId: department.id }, value)
-                          }
+                          onChange={(value) => applyAll(target, value)}
                         />
                         <span
                           style={{ color: granted ? "#4ade80" : "#a78bfa", display: "inline-flex" }}
@@ -429,14 +508,11 @@ function AuthorizationColumn({
                       </div>
 
                       {open && (
-                        <PermissionRow
-                          checked={granted}
-                          disabled={false}
-                          label={`${department.name} departmanı için Yetkilendir`}
-                          title="Departmana sonradan katılanları da kapsar"
-                          onChange={(value) =>
-                            toggle({ kind: "department", departmentId: department.id }, value)
-                          }
+                        <PermissionRows
+                          name={`${department.name} departmanı`}
+                          current={current}
+                          actor={actor}
+                          onChange={(next) => apply(target, next)}
                         />
                       )}
                     </div>
@@ -450,7 +526,7 @@ function AuthorizationColumn({
           <span>Kullanıcılar</span>
           {expandButtons(
             "user:",
-            users.filter((user) => user.isAdmin !== true).map((user) => `user:${user.userId}`),
+            users.map((user) => `user:${user.userId}`),
           )}
         </div>
 
@@ -472,14 +548,30 @@ function AuthorizationColumn({
               ? placeholder(query ? "Eşleşen kullanıcı yok." : "Başka kullanıcı yok.")
               : visibleUsers.map((user) => {
                   const isAdmin = user.isAdmin === true;
-                  const direct = grants.userIds.includes(user.userId);
-                  const viaDepartment =
-                    user.departmentId !== null && grants.departmentIds.includes(user.departmentId);
-                  const allowed = isAdmin || direct || viaDepartment;
+                  const isItemOwner = item !== null && user.userId === item.encrypted.ownerId;
+                  const locked = isItemOwner
+                    ? "Parolanın sahibi her şeyi yapabilir"
+                    : isAdmin
+                      ? "Yöneticiler bütün parolalarda her şeyi yapabilir"
+                      : undefined;
+                  const target: GrantTarget = { kind: "user", userId: user.userId };
+                  const current = locked
+                    ? { view: true, edit: true, delete: true, share: true }
+                    : asPermissions(grantOf(grants, target));
+                  const inherited =
+                    user.departmentId !== null
+                      ? asPermissions(
+                          grantOf(grants, { kind: "department", departmentId: user.departmentId }),
+                        )
+                      : null;
+                  const direct = current.view;
+                  const viaDepartment = inherited?.view === true;
+                  const allowed = direct || viaDepartment;
                   const key = `user:${user.userId}`;
-                  const open = !isAdmin && expanded.has(key);
+                  const open = expanded.has(key);
 
                   const description = [
+                    isItemOwner ? "Sahip" : null,
                     isAdmin ? "Yönetici" : user.departmentName,
                     user.status === "invited" ? "henüz kaydolmadı" : null,
                     allowed && keyStatus.get(user.userId) === false && !item?.pendingSync
@@ -492,29 +584,19 @@ function AuthorizationColumn({
                   return (
                     <div key={user.userId}>
                       <div className="pm-tree-row">
-                        {isAdmin ? (
-                          <span style={{ width: 18, flexShrink: 0 }} />
-                        ) : (
-                          <Chevron
-                            open={open}
-                            onToggle={() => flip(key)}
-                            label={`${user.displayName} yetkileri`}
-                          />
-                        )}
+                        <Chevron
+                          open={open}
+                          onToggle={() => flip(key)}
+                          label={`${user.displayName} yetkileri`}
+                        />
                         <Checkbox
-                          state={isAdmin || direct ? true : viaDepartment ? "mixed" : false}
-                          disabled={isAdmin}
-                          label={`${user.displayName} için yetki`}
+                          state={direct ? permissionState(current) : viaDepartment ? "mixed" : false}
+                          disabled={locked !== undefined}
+                          label={`${user.displayName} için bütün yetkiler`}
                           title={
-                            isAdmin
-                              ? "Yöneticiler bütün parolalara erişir"
-                              : !direct && viaDepartment
-                                ? "Departmanı üzerinden yetkili"
-                                : undefined
+                            locked ?? (!direct && viaDepartment ? "Departmanı üzerinden yetkili" : undefined)
                           }
-                          onChange={(granted) =>
-                            toggle({ kind: "user", userId: user.userId }, granted)
-                          }
+                          onChange={(value) => applyAll(target, value)}
                         />
                         <span style={{ color: keyColor(user, allowed), display: "inline-flex" }}>
                           <Icon size={15}>{isAdmin ? icons.shield : icons.user}</Icon>
@@ -538,13 +620,13 @@ function AuthorizationColumn({
                       </div>
 
                       {open && (
-                        <PermissionRow
-                          checked={direct}
-                          disabled={false}
-                          label={`${user.displayName} için Yetkilendir`}
-                          onChange={(granted) =>
-                            toggle({ kind: "user", userId: user.userId }, granted)
-                          }
+                        <PermissionRows
+                          name={user.displayName}
+                          current={current}
+                          actor={actor}
+                          locked={locked}
+                          inherited={locked ? null : inherited}
+                          onChange={(next) => apply(target, next)}
                         />
                       )}
                     </div>
@@ -670,9 +752,59 @@ type RekeyedItem = {
   departmentAccesses: { departmentId: Id<"departments">; keyVersion: number; access: WrappedKey }[];
 };
 
+/** Silme yetkisi olup düzenleme yetkisi olmayanlar için yalnızca silme. */
+function DeleteItemForm({
+  id,
+  onCancel,
+  onDeleted,
+}: {
+  id: Id<"items">;
+  onCancel: () => void;
+  onDeleted: () => void;
+}) {
+  const removeItem = useMutation(api.items.remove);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+
+  return (
+    <div>
+      <p style={{ ...styles.error, marginTop: 0 }}>
+        Kayıt, paylaşılan herkes için kalıcı olarak silinecek. Bu işlem geri alınamaz.
+      </p>
+      {error && (
+        <p role="alert" style={styles.error}>
+          {error}
+        </p>
+      )}
+      <div style={{ display: "flex", gap: 8 }}>
+        <button
+          type="button"
+          style={{ ...styles.button, background: "#dc2626" }}
+          disabled={busy}
+          onClick={() => {
+            setBusy(true);
+            setError("");
+            removeItem({ id })
+              .then(onDeleted)
+              .catch((err: unknown) => {
+                setError(errorMessage(err));
+                setBusy(false);
+              });
+          }}
+        >
+          {busy ? "Siliniyor..." : "Evet, kalıcı olarak sil"}
+        </button>
+        <button type="button" style={styles.secondaryButton} onClick={onCancel} disabled={busy}>
+          Vazgeç
+        </button>
+      </div>
+    </div>
+  );
+}
+
 /**
- * Kaydın başlığını, kullanıcı adını ve parolasını değiştirir. Yalnızca sahip
- * düzenleyebilir. Her düzenleme yeni bir DEK ile yapılır ve erişimi olan
+ * Kaydın başlığını, kullanıcı adını ve parolasını değiştirir. Düzenleme yetkisi olan
+ * herkes düzenleyebilir. Her düzenleme yeni bir DEK ile yapılır ve erişimi olan
  * herkese yeniden paketlenir; parola alanı boş bırakılırsa mevcut parola
  * korunur.
  */
@@ -680,11 +812,13 @@ function EditItemForm({
   item,
   onCancel,
   onSaved,
+  canDelete,
   onDeleted,
 }: {
   item: { id: Id<"items">; title: string; username: string | null };
   onCancel: () => void;
   onSaved: () => void;
+  canDelete: boolean;
   onDeleted: () => void;
 }) {
   const convex = useConvex();
@@ -802,6 +936,7 @@ function EditItemForm({
         </button>
       </div>
 
+      {canDelete && (
       <div style={{ marginTop: 18, paddingTop: 14, borderTop: "1px solid #353b48" }}>
         {confirmingDelete ? (
           <>
@@ -838,6 +973,7 @@ function EditItemForm({
           </button>
         )}
       </div>
+      )}
     </form>
   );
 }
@@ -866,7 +1002,7 @@ function PendingOperations({
   const describe = (op: QueuedOp) =>
     op.kind === "create"
       ? `Yeni kayıt: ${titleOf(op.item.itemId)}`
-      : `${op.granted ? "Yetki verildi" : "Yetki kaldırıldı"}: ${titleOf(op.itemId)} → ${targetName(op.target)}`;
+      : `${op.granted ? "Yetki güncellendi" : "Yetki kaldırıldı"}: ${titleOf(op.itemId)} → ${targetName(op.target)}`;
 
   return (
     <details
@@ -1743,7 +1879,7 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
               >
                 {copying ? "Kopyalanıyor..." : "Parolayı kopyala"}
               </button>
-              {selected.vault.isOwner && (
+              {(selected.vault.permissions.edit || selected.vault.permissions.delete) && (
                 <button
                   type="button"
                   style={{ ...styles.secondaryButton, opacity: canEdit ? 1 : 0.5 }}
@@ -1751,7 +1887,7 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
                   disabled={!canEdit}
                   title={isOnline ? undefined : "Düzenleme ve silme için bağlantı gerekli"}
                 >
-                  Düzenle
+                  {selected.vault.permissions.edit ? "Düzenle" : "Sil"}
                 </button>
               )}
             </div>
@@ -1803,6 +1939,17 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
             <div className="pm-empty" style={{ minHeight: 240 }}>
               Detaylarını ve geçmişini görmek için soldan bir parola seç.
             </div>
+          ) : mode === "edit" && selected.vault.id !== null && !selected.vault.permissions.edit ? (
+            <DeleteItemForm
+              id={selected.vault.id}
+              onCancel={() => setMode("view")}
+              onDeleted={() => {
+                setMode("view");
+                setSelectedItemId(null);
+                setError("");
+                setSuccess("Kayıt silindi.");
+              }}
+            />
           ) : mode === "edit" && selected.vault.id !== null ? (
             <EditItemForm
               key={selected.vault.itemId}
@@ -1813,6 +1960,7 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
                 setError("");
                 setSuccess("Parola güncellendi.");
               }}
+              canDelete={selected.vault.permissions.delete}
               onDeleted={() => {
                 setMode("view");
                 setSelectedItemId(null);
@@ -1831,6 +1979,12 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
                 <dd style={{ margin: 0, letterSpacing: 2 }}>••••••••</dd>
                 <dt style={styles.muted}>Sahip</dt>
                 <dd style={{ margin: 0 }}>{selected.vault.isOwner ? "Sen" : "Seninle paylaşılmış"}</dd>
+                <dt style={styles.muted}>Yetkilerin</dt>
+                <dd style={{ margin: 0 }}>
+                  {PERMISSION_KEYS.filter((key) => selected.vault.permissions[key])
+                    .map((key) => PERMISSION_LABELS[key])
+                    .join(", ")}
+                </dd>
                 <dt style={{ ...styles.muted, alignSelf: "center" }}>Klasör</dt>
                 <dd style={{ margin: 0 }}>
                   {selected.vault.isOwner && isOnline && selected.vault.id !== null ? (

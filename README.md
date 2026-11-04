@@ -205,7 +205,7 @@ iki kez paketlense bile sonuçlar birbirinden farklıdır.
 
 ### Düzenleme
 
-Düzenlemeyi yalnızca kaydın sahibi yapabilir. Her düzenleme yeni bir DEK ile
+Düzenlemeyi düzenleme yetkisi olan herkes yapabilir. Her düzenleme yeni bir DEK ile
 yapılır ve erişimi olan herkese (kişiler ve departmanlar) yeniden paketlenir.
 Böylece daha önce erişimi kaldırılmış birinin elinde kalan eski DEK, yeni
 parolayı açamaz. Sunucu düzenlemeyi yalnızca güncel `keyVersion` ile ve
@@ -237,6 +237,26 @@ Bir kayda iki yoldan erişilebilir:
 - **Departman üzerinden:** DEK departmanın açık anahtarına paketlidir
   (`itemDepartmentAccess`); departmanın özel anahtarı da alıcıya paketlidir
   (`departmentKeys`). İstemci önce departman anahtarını, sonra DEK'i açar.
+
+### Yetkiler
+
+Her paylaşım kuralı (kişiye ya da departmana) ayrı yetkiler taşır:
+
+| Yetki | Ne sağlar |
+|---|---|
+| Görüntüleme | Parolayı açma ve kopyalama. Kuralın varlığı bu yetkidir; diğerlerinin önkoşuludur. |
+| Düzenleme | Başlık, kullanıcı adı ve parolayı değiştirme (yeni DEK ile yeniden şifreleme). |
+| Silme | Parolayı kalıcı olarak silme. |
+| Yetkilendirme | Başkalarına kural verme, değiştirme, kaldırma. |
+
+Sahip ve yöneticiler her yetkiye sahiptir. Diğer kullanıcılarda kişiye ve
+departmanına verilen kuralların birleşimi geçerlidir. Yetkilendirme yetkisi
+olan biri yalnızca kendisinde olan yetkileri verebilir, kendisinde olmayan
+bir yetki içeren kuralı değiştiremez ve kendi kuralını değiştiremez.
+
+Yetkiler sunucuda uygulanır. Düzenleyen kişi sahip olmasa da kaydı yeniden
+şifreler; sunucu, sahibin her yeniden şifrelemede alıcılar arasında kalmasını
+şart koşar.
 
 ### Departman anahtarları
 

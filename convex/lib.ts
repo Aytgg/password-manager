@@ -138,6 +138,53 @@ export async function itemGrants(ctx: QueryCtx, itemId: Id<"items">) {
   };
 }
 
+/** Bir kayıt üzerindeki yetkiler. Görüntüleme diğerlerinin önkoşuludur. */
+export type Permissions = { view: boolean; edit: boolean; delete: boolean; share: boolean };
+
+/** Görüntülemenin yanında verilebilen ek yetkiler. */
+export type ExtraPermissions = { edit: boolean; delete: boolean; share: boolean };
+
+export const NO_PERMISSIONS: Permissions = { view: false, edit: false, delete: false, share: false };
+export const ALL_PERMISSIONS: Permissions = { view: true, edit: true, delete: true, share: true };
+
+export function grantPermissions(grant: Doc<"itemGrants">): ExtraPermissions {
+  return { edit: grant.canEdit === true, delete: grant.canDelete === true, share: grant.canShare === true };
+}
+
+/**
+ * Kullanıcının kayıt üzerindeki yetkileri: sahip ve yöneticiler her şeyi
+ * yapar; diğerlerinde kişiye ve departmanına verilen kuralların birleşimi.
+ */
+export async function itemPermissions(
+  ctx: QueryCtx,
+  user: Doc<"users">,
+  item: Doc<"items">,
+): Promise<Permissions> {
+  if (item.ownerId === user._id || user.role === "admin") {
+    return ALL_PERMISSIONS;
+  }
+
+  const result = { ...NO_PERMISSIONS };
+
+  for (const grant of await ctx.db
+    .query("itemGrants")
+    .withIndex("by_item", (q) => q.eq("item", item._id))
+    .collect()) {
+    if (
+      grant.userId === user._id ||
+      (grant.departmentId !== undefined && grant.departmentId === user.departmentId)
+    ) {
+      const extra = grantPermissions(grant);
+      result.view = true;
+      result.edit ||= extra.edit;
+      result.delete ||= extra.delete;
+      result.share ||= extra.share;
+    }
+  }
+
+  return result;
+}
+
 /** DEK'i doğrudan kendi açık anahtarına paketlenmesi gerekenler: sahip,
  * kişiye doğrudan yetki verilenler ve bütün yöneticiler (yöneticiler her
  * parolayı görür). Departman üyeleri departman anahtarı üzerinden erişir. */

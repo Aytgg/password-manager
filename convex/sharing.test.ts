@@ -488,7 +488,7 @@ describe("kişiye paylaşım ve rekey", () => {
     await as("alice").mutation(api.items.setUserGrant, { id, userId: uid("carol"), granted: false });
 
     const task = (await as("alice").query(api.items.pendingWork, {})).rekeys[0];
-    expect(task.recipients.map((r) => r.userId)).toEqual([uid("admin")]);
+    expect(task.recipients.map((r) => r.userId).sort()).toEqual([uid("admin"), uid("alice")].sort());
     expect(task.departments).toEqual([
       { departmentId: ids.yazilim, keyVersion: 1, publicKey: publicKey(90) },
     ]);
@@ -502,7 +502,7 @@ describe("kişiye paylaşım ve rekey", () => {
       departmentAccesses: [{ departmentId: ids.yazilim, keyVersion: 1, access: wrapped(21) }],
     };
 
-    await expect(as("bob").mutation(api.items.rekey, valid)).rejects.toThrow(/sahibi değilsin/);
+    await expect(as("bob").mutation(api.items.rekey, valid)).rejects.toThrow(/düzenleme yetkin yok/);
     await expect(
       as("alice").mutation(api.items.rekey, { ...valid, keyVersion: 0 }),
     ).rejects.toThrow(/başka bir işlemle güncellendi/);
@@ -541,12 +541,14 @@ describe("kişiye paylaşım ve rekey", () => {
     await shareWithDepartment("alice", id, ids.yazilim);
 
     await expect(as("carol").query(api.items.editTargets, { id })).rejects.toThrow(
-      /sahibi değilsin/,
+      /düzenleme yetkin yok/,
     );
 
     const targets = await as("alice").query(api.items.editTargets, { id });
     expect(targets.item.access.kind).toBe("direct");
-    expect(targets.recipients.map((r) => r.userId).sort()).toEqual([uid("admin"), uid("carol")].sort());
+    expect(targets.recipients.map((r) => r.userId).sort()).toEqual(
+      [uid("admin"), uid("alice"), uid("carol")].sort(),
+    );
     expect(targets.departments.map((d) => d.departmentId)).toEqual([ids.yazilim]);
 
     await as("alice").mutation(api.items.rekey, {
@@ -579,7 +581,7 @@ describe("kişiye paylaşım ve rekey", () => {
     await shareWithUser("alice", id, uid("carol"));
     await shareWithDepartment("alice", id, ids.yazilim);
 
-    await expect(as("carol").mutation(api.items.remove, { id })).rejects.toThrow(/sahibi değilsin/);
+    await expect(as("carol").mutation(api.items.remove, { id })).rejects.toThrow(/silme yetkin yok/);
 
     await as("alice").mutation(api.items.remove, { id });
 
@@ -608,7 +610,14 @@ describe("kişiye paylaşım ve rekey", () => {
     });
 
     const [own] = await as("alice").query(api.items.listMine, {});
-    expect(own.grants).toEqual({ userIds: [uid("carol")], departmentIds: [ids.satis] });
+    expect(own.grants).toEqual({
+      userIds: [uid("carol")],
+      departmentIds: [ids.satis],
+      permissions: {
+        [uid("carol")]: { edit: false, delete: false, share: false },
+        [ids.satis]: { edit: false, delete: false, share: false },
+      },
+    });
 
     const [shared] = await as("carol").query(api.items.listMine, {});
     expect(shared.grants).toBeNull();
@@ -812,23 +821,158 @@ describe("kişiye paylaşım ve rekey", () => {
     expect(await departmentKeyNames(ids.satis)).toEqual(["admin", "carol", "manager"]);
   });
 
-  test("paylaşımı yalnızca sahip görür ve yönetir", async () => {
+  test("paylaşımı yalnızca yetkilendirme yetkisi olan görür ve yönetir", async () => {
     const { ids, uid, as, createItem, shareWithUser } = await setup();
     const id = await createItem("alice");
 
     await shareWithUser("alice", id, uid("bob"));
 
-    await expect(as("bob").query(api.items.sharing, { id })).rejects.toThrow(/sahibi değilsin/);
+    await expect(as("bob").query(api.items.sharing, { id })).rejects.toThrow(/yetkilendirme yetkin yok/);
     await expect(
       as("bob").mutation(api.items.setUserGrant, { id, userId: uid("carol"), granted: true }),
-    ).rejects.toThrow(/sahibi değilsin/);
-    await expect(
-      as("admin").mutation(api.items.setDepartmentGrant, {
+    ).rejects.toThrow(/yetkilendirme yetkin yok/);
+
+    // Yöneticiler her parolayı yetkilendirebilir.
+    await as("admin").mutation(api.items.setDepartmentGrant, {
+      id,
+      departmentId: ids.satis,
+      granted: true,
+    });
+  });
+});
+
+describe("ayrı yetkiler", () => {
+  const none = { edit: false, delete: false, share: false };
+
+  test("yetkiler listede gelir; görüntüleme dışındakiler ayrıca verilir", async () => {
+    const { uid, as, createItem, shareWithUser } = await setup();
+    const id = await createItem("alice");
+    await shareWithUser("alice", id, uid("bob"));
+
+    const bobItem = async () => (await as("bob").query(api.items.listMine, {}))[0];
+    expect((await bobItem()).permissions).toEqual({ view: true, ...none });
+    expect((await bobItem()).grants).toBeNull();
+
+    await as("alice").mutation(api.items.setUserGrant, {
+      id,
+      userId: uid("bob"),
+      granted: true,
+      permissions: { edit: true, delete: false, share: true },
+    });
+    expect((await bobItem()).permissions).toEqual({ view: true, edit: true, delete: false, share: true });
+    // Yetkilendirebilen kişi kuralları da görür.
+    expect((await bobItem()).grants?.permissions[uid("bob")]).toEqual({
+      edit: true,
+      delete: false,
+      share: true,
+    });
+
+    // `permissions` verilmezse mevcut ek yetkiler korunur.
+    await as("alice").mutation(api.items.setUserGrant, { id, userId: uid("bob"), granted: true });
+    expect((await bobItem()).permissions.edit).toBe(true);
+
+    expect((await as("alice").query(api.items.listMine, {}))[0].permissions).toEqual({
+      view: true,
+      edit: true,
+      delete: true,
+      share: true,
+    });
+  });
+
+  test("düzenleme yetkisi olan yeniden şifreler; sahip alıcılarda kalmalı", async () => {
+    const { uid, as, createItem, shareWithUser, getItem } = await setup();
+    const id = await createItem("alice");
+    await shareWithUser("alice", id, uid("bob"));
+    await as("alice").mutation(api.items.setUserGrant, {
+      id,
+      userId: uid("bob"),
+      granted: true,
+      permissions: { edit: true, delete: false, share: false },
+    });
+
+    const targets = await as("bob").query(api.items.editTargets, { id });
+    expect(targets.item.access.kind).toBe("direct");
+    expect(targets.recipients.map((r) => r.userId)).toContain(uid("alice"));
+
+    const rekey = (userIds: Id<"users">[]) =>
+      as("bob").mutation(api.items.rekey, {
         id,
-        departmentId: ids.satis,
+        keyVersion: targets.item.keyVersion,
+        metadata: sealed(7),
+        secret: sealed(8),
+        accesses: userIds.map((userId, n) => ({ userId, access: wrapped(60 + n) })),
+        departmentAccesses: [],
+      });
+
+    await expect(rekey([uid("bob")])).rejects.toThrow(/sahibinin erişimi kaldırılamaz/);
+    await rekey([uid("alice"), uid("bob")]);
+    expect(await getItem(id)).toMatchObject({ metadata: sealed(7) });
+
+    await expect(as("bob").mutation(api.items.remove, { id })).rejects.toThrow(/silme yetkin yok/);
+  });
+
+  test("silme yetkisi departman üzerinden de verilir", async () => {
+    const { ids, as, runDepartmentWork, createItem, shareWithDepartment, getItem } = await setup();
+    await runDepartmentWork();
+    const id = await createItem("alice");
+    await shareWithDepartment("alice", id, ids.satis);
+
+    await expect(as("carol").mutation(api.items.remove, { id })).rejects.toThrow(/silme yetkin yok/);
+
+    await as("alice").mutation(api.items.setDepartmentGrant, {
+      id,
+      departmentId: ids.satis,
+      granted: true,
+      permissions: { edit: false, delete: true, share: false },
+    });
+    await as("carol").mutation(api.items.remove, { id });
+    expect(await getItem(id)).toBeNull();
+  });
+
+  test("yetkilendirici yalnız kendinde olan yetkileri verir", async () => {
+    const { ids, uid, as, createItem, shareWithUser } = await setup();
+    const id = await createItem("alice");
+    await shareWithUser("alice", id, uid("bob"));
+    await as("alice").mutation(api.items.setUserGrant, {
+      id,
+      userId: uid("bob"),
+      granted: true,
+      permissions: { edit: true, delete: false, share: false },
+    });
+    await shareWithUser("alice", id, uid("carol"));
+    await as("alice").mutation(api.items.setUserGrant, {
+      id,
+      userId: uid("carol"),
+      granted: true,
+      permissions: { edit: false, delete: false, share: true },
+    });
+
+    // Carol'da düzenleme yok: düzenleme veremez, düzenleme içeren kuralı değiştiremez.
+    await expect(
+      as("carol").mutation(api.items.setDepartmentGrant, {
+        id,
+        departmentId: ids.yazilim,
         granted: true,
+        permissions: { edit: true, delete: false, share: false },
       }),
-    ).rejects.toThrow(/sahibi değilsin/);
+    ).rejects.toThrow(/veremezsin/);
+    await expect(
+      as("carol").mutation(api.items.setUserGrant, { id, userId: uid("bob"), granted: false }),
+    ).rejects.toThrow(/değiştiremezsin/);
+    await expect(
+      as("carol").mutation(api.items.setUserGrant, { id, userId: uid("carol"), granted: false }),
+    ).rejects.toThrow(/Kendi yetkini/);
+
+    await as("carol").mutation(api.items.setDepartmentGrant, {
+      id,
+      departmentId: ids.yazilim,
+      granted: true,
+      permissions: { ...none, share: true },
+    });
+    expect((await as("alice").query(api.items.listMine, {}))[0].grants?.permissions[ids.yazilim]).toEqual({
+      ...none,
+      share: true,
+    });
   });
 });
 

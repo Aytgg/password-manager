@@ -36,7 +36,29 @@ export type EncryptedItem = {
  * (henüz sunucuya gitmemiş) kayıtta `id` yoktur. */
 export type HistoryRecord = { id?: Id<"itemHistory">; entry: SealedField };
 
-export type Grants = { userIds: Id<"users">[]; departmentIds: Id<"departments">[] };
+/** Görüntülemenin yanında verilebilen ek yetkiler. */
+export type ExtraPermissions = { edit: boolean; delete: boolean; share: boolean };
+export type Permissions = ExtraPermissions & { view: boolean };
+
+export const NO_EXTRA: ExtraPermissions = { edit: false, delete: false, share: false };
+const ALL: Permissions = { view: true, edit: true, delete: true, share: true };
+
+export type Grants = {
+  userIds: Id<"users">[];
+  departmentIds: Id<"departments">[];
+  /** Kural bazında ek yetkiler (anahtar kişi ya da departman kimliği). Eski
+   * önbellekte yoktur; yoksa yalnızca görüntüleme. */
+  permissions?: Record<string, ExtraPermissions>;
+};
+
+export function targetId(target: GrantTarget) {
+  return target.kind === "user" ? target.userId : target.departmentId;
+}
+
+/** Kuralın ek yetkileri; kural yoksa `null`. */
+export function grantOf(grants: Grants | null, target: GrantTarget): ExtraPermissions | null {
+  return hasGrant(grants, target) ? (grants?.permissions?.[targetId(target)] ?? NO_EXTRA) : null;
+}
 
 export type GrantTarget =
   | { kind: "user"; userId: Id<"users"> }
@@ -47,7 +69,14 @@ export type GrantTarget =
  * gönderilmemiş bir kayıt da yetkilendirilebilir. */
 export type QueuedOp =
   | { kind: "create"; item: NewItem; folderId?: Id<"folders"> | null }
-  | { kind: "grant"; itemId: string; target: GrantTarget; granted: boolean };
+  | {
+      kind: "grant";
+      itemId: string;
+      target: GrantTarget;
+      granted: boolean;
+      /** Eski sürümün kuyruğunda yoktur; yoksa mevcut ek yetkiler korunur. */
+      permissions?: ExtraPermissions;
+    };
 
 type CacheContent = {
   version: 1;
@@ -64,6 +93,8 @@ export type VaultItem = {
   /** Sunucudaki kimlik; kayıt henüz gönderilmediyse `null`. */
   id: Id<"items"> | null;
   isOwner: boolean;
+  /** Kullanıcının bu kayıt üzerindeki yetkileri. */
+  permissions: Permissions;
   /** Bulunduğu klasör; `null` ise kökte. */
   folderId: Id<"folders"> | null;
   encrypted: EncryptedItem;
@@ -87,15 +118,33 @@ function hasGrant(grants: Grants | null, target: GrantTarget) {
     : grants.departmentIds.includes(target.departmentId);
 }
 
-function applyGrant(grants: Grants, target: GrantTarget, granted: boolean): Grants {
+function applyGrant(
+  grants: Grants,
+  target: GrantTarget,
+  granted: boolean,
+  permissions: ExtraPermissions | undefined,
+): Grants {
+  const key = targetId(target);
+  const map = { ...(grants.permissions ?? {}) };
+
+  if (granted) map[key] = permissions ?? map[key] ?? NO_EXTRA;
+  else delete map[key];
+
   if (target.kind === "user") {
     const others = grants.userIds.filter((id) => id !== target.userId);
-    return { ...grants, userIds: granted ? [...others, target.userId] : others };
+    return { ...grants, permissions: map, userIds: granted ? [...others, target.userId] : others };
   }
 
   const others = grants.departmentIds.filter((id) => id !== target.departmentId);
-  return { ...grants, departmentIds: granted ? [...others, target.departmentId] : others };
+  return {
+    ...grants,
+    permissions: map,
+    departmentIds: granted ? [...others, target.departmentId] : others,
+  };
 }
+
+const samePermissions = (a: ExtraPermissions | null, b: ExtraPermissions | null) =>
+  a === b || (a !== null && b !== null && a.edit === b.edit && a.delete === b.delete && a.share === b.share);
 
 export function toEncryptedItem(item: ServerItem): EncryptedItem {
   return {
@@ -234,9 +283,19 @@ export function useVaultData({ ownerId, isOnline }: { ownerId: string | null; is
         }
 
         if (op.target.kind === "user") {
-          await setUserGrant({ id, userId: op.target.userId, granted: op.granted });
+          await setUserGrant({
+            id,
+            userId: op.target.userId,
+            granted: op.granted,
+            permissions: op.permissions,
+          });
         } else {
-          await setDepartmentGrant({ id, departmentId: op.target.departmentId, granted: op.granted });
+          await setDepartmentGrant({
+            id,
+            departmentId: op.target.departmentId,
+            granted: op.granted,
+            permissions: op.permissions,
+          });
         }
 
         removeFirst();
@@ -265,6 +324,8 @@ export function useVaultData({ ownerId, isOnline }: { ownerId: string | null; is
         itemId: item.itemId,
         id: item.id,
         isOwner: item.isOwner,
+        // Eski önbellekte yoktur: sahibe her şey, diğerlerine görüntüleme.
+        permissions: item.permissions ?? (item.isOwner ? ALL : { ...NO_EXTRA, view: true }),
         folderId: item.folderId ?? null,
         encrypted: toEncryptedItem(item),
         grants: item.grants,
@@ -278,6 +339,7 @@ export function useVaultData({ ownerId, isOnline }: { ownerId: string | null; is
           itemId: op.item.itemId,
           id: null,
           isOwner: true,
+          permissions: ALL,
           folderId: op.folderId ?? null,
           encrypted: {
             itemId: op.item.itemId,
@@ -295,7 +357,7 @@ export function useVaultData({ ownerId, isOnline }: { ownerId: string | null; is
         if (item?.grants) {
           result.set(op.itemId, {
             ...item,
-            grants: applyGrant(item.grants, op.target, op.granted),
+            grants: applyGrant(item.grants, op.target, op.granted, op.permissions),
             pendingSync: true,
           });
         }
@@ -312,8 +374,9 @@ export function useVaultData({ ownerId, isOnline }: { ownerId: string | null; is
     );
   }, []);
 
+  /** Kuralı ekler/kaldırır; `permissions` verilirse ek yetkileri de ayarlar. */
   const setGrant = useCallback(
-    (itemId: string, target: GrantTarget, granted: boolean) => {
+    (itemId: string, target: GrantTarget, granted: boolean, permissions?: ExtraPermissions) => {
       setCache((current) => {
         if (!current) return current;
 
@@ -323,11 +386,15 @@ export function useVaultData({ ownerId, isOnline }: { ownerId: string | null; is
 
         // Geri alınan bir değişiklik kuyruktan düşer; sunucudaki hali zaten bu.
         const base = current.items.find((item) => item.itemId === itemId);
-        const unchanged = base !== undefined && hasGrant(base.grants, target) === granted;
+        const before = base ? grantOf(base.grants, target) : undefined;
+        const after = granted ? (permissions ?? before ?? NO_EXTRA) : null;
+        const unchanged = before !== undefined && samePermissions(before, after);
 
         return {
           ...current,
-          queue: unchanged ? queue : [...queue, { kind: "grant", itemId, target, granted }],
+          queue: unchanged
+            ? queue
+            : [...queue, { kind: "grant", itemId, target, granted, permissions }],
         };
       });
     },

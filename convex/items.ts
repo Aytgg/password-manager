@@ -6,6 +6,10 @@ import { mutation, query } from "./_generated/server";
 import {
   assertSealedField,
   assertWrappedKey,
+  type ExtraPermissions,
+  grantPermissions,
+  itemPermissions,
+  type Permissions,
   currentDepartmentKey,
   deleteItem,
   directRecipients,
@@ -24,18 +28,29 @@ const departmentAccess = v.object({
   access: wrappedKey,
 });
 
-async function requireOwnedItem(
+const extraPermissions = v.object({ edit: v.boolean(), delete: v.boolean(), share: v.boolean() });
+
+const PERMISSION_ERRORS: Record<keyof Permissions, string> = {
+  view: "Bu parolaya erişimin yok.",
+  edit: "Bu parolayı düzenleme yetkin yok.",
+  delete: "Bu parolayı silme yetkin yok.",
+  share: "Bu parolayı yetkilendirme yetkin yok.",
+};
+
+async function requirePermission(
   ctx: QueryCtx,
-  ownerId: Id<"users">,
+  user: Doc<"users">,
   id: Id<"items">,
+  permission: keyof Permissions,
 ) {
   const item = await ctx.db.get(id);
+  const permissions = item ? await itemPermissions(ctx, user, item) : null;
 
-  if (!item || item.ownerId !== ownerId) {
-    throw new ConvexError("Parola bulunamadı ya da sahibi değilsin.");
+  if (!item || !permissions?.[permission]) {
+    throw new ConvexError(PERMISSION_ERRORS[permission]);
   }
 
-  return item;
+  return { item, permissions };
 }
 
 function requireKeyVersion(item: Doc<"items">, expected: number) {
@@ -85,11 +100,19 @@ type KeyPath =
       itemKey: Doc<"itemDepartmentAccess">["access"];
     };
 
+type GrantList = {
+  userIds: Id<"users">[];
+  departmentIds: Id<"departments">[];
+  /** Kural bazında ek yetkiler; anahtar kişi ya da departman kimliği. */
+  permissions: Record<string, ExtraPermissions>;
+};
+
 function serialize(
   item: Doc<"items">,
   access: KeyPath,
   userId: Id<"users">,
-  grants: { userIds: Id<"users">[]; departmentIds: Id<"departments">[] } | null = null,
+  permissions: Permissions,
+  grants: GrantList | null = null,
 ) {
   return {
     id: item._id,
@@ -103,18 +126,37 @@ function serialize(
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
     access,
-    // Yalnızca sahibe: paylaşım paneli çevrimdışıyken bundan çalışır.
+    permissions,
+    // Yalnızca yetkilendirebilenlere: paylaşım paneli çevrimdışıyken bundan
+    // çalışır.
     grants,
   };
 }
 
-async function ownerGrants(ctx: QueryCtx, item: Doc<"items">, userId: Id<"users">) {
-  if (item.ownerId !== userId) {
+async function grantList(
+  ctx: QueryCtx,
+  item: Doc<"items">,
+  permissions: Permissions,
+): Promise<GrantList | null> {
+  if (!permissions.share) {
     return null;
   }
 
-  const { userIds, departmentIds } = await itemGrants(ctx, item._id);
-  return { userIds: [...userIds], departmentIds: [...departmentIds] };
+  const result: GrantList = { userIds: [], departmentIds: [], permissions: {} };
+
+  for (const grant of await ctx.db
+    .query("itemGrants")
+    .withIndex("by_item", (q) => q.eq("item", item._id))
+    .collect()) {
+    const target = grant.userId ?? grant.departmentId;
+    if (!target) continue;
+
+    if (grant.userId) result.userIds.push(grant.userId);
+    else if (grant.departmentId) result.departmentIds.push(grant.departmentId);
+    result.permissions[target] = grantPermissions(grant);
+  }
+
+  return result;
 }
 
 /** Kullanıcının kayda ulaşma yolu: doğrudan paket ya da departmanının
@@ -153,7 +195,7 @@ export const history = query({
     }
 
     return {
-      item: serialize(item, path, user._id),
+      item: serialize(item, path, user._id, await itemPermissions(ctx, user, item)),
       history: await historyRecords(ctx, item._id),
     };
   },
@@ -176,13 +218,15 @@ export const listMine = query({
       const item = await ctx.db.get(access.item);
 
       if (item) {
+        const permissions = await itemPermissions(ctx, user, item);
         results.set(
           item._id,
           serialize(
             item,
             { kind: "direct", access: access.access },
             user._id,
-            await ownerGrants(ctx, item, user._id),
+            permissions,
+            await grantList(ctx, item, permissions),
           ),
         );
       }
@@ -203,12 +247,15 @@ export const listMine = query({
         const item = await ctx.db.get(row.item);
 
         if (item) {
+          const permissions = await itemPermissions(ctx, user, item);
           results.set(
             item._id,
             serialize(
               item,
               { kind: "department", departmentKey: departmentKey.access, itemKey: row.access },
               user._id,
+              permissions,
+              await grantList(ctx, item, permissions),
             ),
           );
         }
@@ -312,14 +359,14 @@ export const move = mutation({
 });
 
 /**
- * Kaydı kalıcı olarak siler. Yalnızca sahip yapabilir; kayıtla birlikte
- * bütün anahtar paketleri ve paylaşım kuralları da silinir.
+ * Kaydı kalıcı olarak siler. Silme yetkisi olan yapabilir; kayıtla birlikte
+ * bütün anahtar paketleri, paylaşım kuralları ve geçmişi de silinir.
  */
 export const remove = mutation({
   args: { id: v.id("items") },
   handler: async (ctx, args) => {
     const user = await requireActiveUser(ctx);
-    const item = await requireOwnedItem(ctx, user._id, args.id);
+    const { item } = await requirePermission(ctx, user, args.id, "delete");
 
     await deleteItem(ctx, item._id);
   },
@@ -359,12 +406,13 @@ export const shareDirectory = query({
   },
 });
 
-/** Sahibin yetkilendirme paneli: departman ve kişi bazında paylaşım durumu. */
+/** Yetkilendirme paneli: departman ve kişi bazında paylaşım durumu.
+ * Yetkilendirme yetkisi gerekir. */
 export const sharing = query({
   args: { id: v.id("items") },
   handler: async (ctx, args) => {
     const user = await requireActiveUser(ctx);
-    const item = await requireOwnedItem(ctx, user._id, args.id);
+    const { item } = await requirePermission(ctx, user, args.id, "share");
     const grants = await itemGrants(ctx, item._id);
 
     const directKeyUserIds = new Set(
@@ -435,14 +483,85 @@ export const sharing = query({
   },
 });
 
+/**
+ * Kişiye ya da departmana verilen kuralı ekler, ek yetkilerini değiştirir ya
+ * da kaldırır. Yetkilendirme yetkisi gerekir. Sahip ve yöneticiler dışındaki
+ * yetkilendiriciler yalnızca kendilerinde olan yetkileri verebilir ve
+ * kendilerinde olmayan bir yetki içeren kuralı değiştiremez.
+ */
+async function updateGrant(
+  ctx: MutationCtx,
+  user: Doc<"users">,
+  itemId: Id<"items">,
+  target: { userId: Id<"users"> } | { departmentId: Id<"departments"> },
+  granted: boolean,
+  permissions: ExtraPermissions | undefined,
+) {
+  const { item, permissions: actor } = await requirePermission(ctx, user, itemId, "share");
+  const full = item.ownerId === user._id || user.role === "admin";
+
+  const existing = (
+    await ctx.db
+      .query("itemGrants")
+      .withIndex("by_item", (q) => q.eq("item", item._id))
+      .collect()
+  ).find((grant) =>
+    "userId" in target ? grant.userId === target.userId : grant.departmentId === target.departmentId,
+  );
+
+  const exceeds = (wanted: ExtraPermissions) =>
+    !full &&
+    ((wanted.edit && !actor.edit) || (wanted.delete && !actor.delete) || (wanted.share && !actor.share));
+
+  if (existing && exceeds(grantPermissions(existing))) {
+    throw new ConvexError("Bu kuralda senin sahip olmadığın yetkiler var; değiştiremezsin.");
+  }
+
+  if (!granted) {
+    if (existing) {
+      await ctx.db.delete(existing._id);
+      await removeDisallowedAccess(ctx, item._id);
+    }
+    return;
+  }
+
+  const next = permissions ??
+    (existing ? grantPermissions(existing) : { edit: false, delete: false, share: false });
+
+  if (exceeds(next)) {
+    throw new ConvexError("Sahip olmadığın bir yetkiyi veremezsin.");
+  }
+
+  const fields = {
+    canEdit: next.edit || undefined,
+    canDelete: next.delete || undefined,
+    canShare: next.share || undefined,
+  };
+
+  if (existing) {
+    await ctx.db.patch(existing._id, fields);
+  } else {
+    await ctx.db.insert("itemGrants", { item: item._id, ...target, ...fields });
+  }
+}
+
 export const setUserGrant = mutation({
-  args: { id: v.id("items"), userId: v.id("users"), granted: v.boolean() },
+  args: {
+    id: v.id("items"),
+    userId: v.id("users"),
+    granted: v.boolean(),
+    permissions: v.optional(extraPermissions),
+  },
   handler: async (ctx, args) => {
     const user = await requireActiveUser(ctx);
-    const item = await requireOwnedItem(ctx, user._id, args.id);
+    const item = await ctx.db.get(args.id);
 
-    if (args.userId === item.ownerId) {
+    if (item && args.userId === item.ownerId) {
       throw new ConvexError("Parola sahibinin erişimi değiştirilemez.");
+    }
+
+    if (args.userId === user._id && user.role !== "admin") {
+      throw new ConvexError("Kendi yetkini değiştiremezsin.");
     }
 
     const target = await ctx.db.get(args.userId);
@@ -451,32 +570,11 @@ export const setUserGrant = mutation({
       throw new ConvexError("Yöneticiler zaten bütün parolalara erişir.");
     }
 
-    const existing = (
-      await ctx.db
-        .query("itemGrants")
-        .withIndex("by_item", (q) => q.eq("item", item._id))
-        .collect()
-    ).find((grant) => grant.userId === args.userId);
-
-    if (args.granted) {
-      if (existing) {
-        return;
-      }
-
-      const recipient = await ctx.db.get(args.userId);
-
-      if (!recipient || recipient.status === "disabled") {
-        throw new ConvexError("Yetki verilecek kullanıcı bulunamadı.");
-      }
-
-      await ctx.db.insert("itemGrants", { item: item._id, userId: args.userId });
-      return;
+    if (args.granted && (!target || target.status === "disabled")) {
+      throw new ConvexError("Yetki verilecek kullanıcı bulunamadı.");
     }
 
-    if (existing) {
-      await ctx.db.delete(existing._id);
-      await removeDisallowedAccess(ctx, item._id);
-    }
+    await updateGrant(ctx, user, args.id, { userId: args.userId }, args.granted, args.permissions);
   },
 });
 
@@ -485,36 +583,23 @@ export const setDepartmentGrant = mutation({
     id: v.id("items"),
     departmentId: v.id("departments"),
     granted: v.boolean(),
+    permissions: v.optional(extraPermissions),
   },
   handler: async (ctx, args) => {
     const user = await requireActiveUser(ctx);
-    const item = await requireOwnedItem(ctx, user._id, args.id);
 
     if (!(await ctx.db.get(args.departmentId))) {
       throw new ConvexError("Departman bulunamadı.");
     }
 
-    const existing = (
-      await ctx.db
-        .query("itemGrants")
-        .withIndex("by_item", (q) => q.eq("item", item._id))
-        .collect()
-    ).find((grant) => grant.departmentId === args.departmentId);
-
-    if (args.granted) {
-      if (!existing) {
-        await ctx.db.insert("itemGrants", {
-          item: item._id,
-          departmentId: args.departmentId,
-        });
-      }
-      return;
-    }
-
-    if (existing) {
-      await ctx.db.delete(existing._id);
-      await removeDisallowedAccess(ctx, item._id);
-    }
+    await updateGrant(
+      ctx,
+      user,
+      args.id,
+      { departmentId: args.departmentId },
+      args.granted,
+      args.permissions,
+    );
   },
 });
 
@@ -632,7 +717,7 @@ export const rekey = mutation({
   },
   handler: async (ctx, args) => {
     const user = await requireActiveUser(ctx);
-    const item = await requireOwnedItem(ctx, user._id, args.id);
+    const { item } = await requirePermission(ctx, user, args.id, "edit");
 
     requireKeyVersion(item, args.keyVersion);
     assertSealedField(args.metadata);
@@ -680,7 +765,7 @@ export const rekey = mutation({
       seen.add(entry.userId);
     }
 
-    if (!seen.has(user._id)) {
+    if (recipients.has(item.ownerId) && !seen.has(item.ownerId)) {
       throw new ConvexError("Parola sahibinin erişimi kaldırılamaz.");
     }
 
@@ -789,15 +874,19 @@ async function keyTargets(ctx: QueryCtx, item: Doc<"items">) {
   return { recipients, currentUsers, departments };
 }
 
-/** Yeni bir DEK'in paketlenmesi gerekenler: anahtarı hâlâ kurala uyan
- * kişiler (eksikler sonra doldurulur) ve anahtarı hazır bütün departmanlar. */
-async function rekeyRecipients(ctx: QueryCtx, item: Doc<"items">, ownerId: Id<"users">) {
+/** Yeni bir DEK'in paketlenmesi gerekenler: kaydın sahibi, anahtarı hâlâ
+ * kurala uyan kişiler (eksikler sonra doldurulur) ve anahtarı hazır bütün
+ * departmanlar. */
+async function rekeyRecipients(ctx: QueryCtx, item: Doc<"items">) {
   const { recipients, currentUsers, departments } = await keyTargets(ctx, item);
+  const userIds = new Set([...currentUsers].filter((id) => recipients.has(id)));
+
+  if (recipients.has(item.ownerId)) {
+    userIds.add(item.ownerId);
+  }
 
   return {
-    recipients: [...currentUsers]
-      .filter((id) => id !== ownerId && recipients.has(id))
-      .map((id) => ({ userId: id, publicKey: recipients.get(id)!.publicKey })),
+    recipients: [...userIds].map((id) => ({ userId: id, publicKey: recipients.get(id)!.publicKey })),
     departments: departments.map(({ departmentId, keyVersion, publicKey }) => ({
       departmentId,
       keyVersion,
@@ -807,24 +896,25 @@ async function rekeyRecipients(ctx: QueryCtx, item: Doc<"items">, ownerId: Id<"u
 }
 
 /**
- * Düzenleme için: kaydın sahibine ait güncel hali ve yeni DEK'in
- * paketleneceği alıcılar. Düzenleme `rekey` ile kaydedilir.
+ * Düzenleme için: kaydın güncel hali (çağıranın ulaşma yoluyla) ve yeni
+ * DEK'in paketleneceği alıcılar. Düzenleme yetkisi gerekir; düzenleme
+ * `rekey` ile kaydedilir.
  */
 export const editTargets = query({
   args: { id: v.id("items") },
   handler: async (ctx, args) => {
     const user = await requireActiveUser(ctx);
-    const item = await requireOwnedItem(ctx, user._id, args.id);
-    const access = await myAccess(ctx, item._id, user._id);
+    const { item, permissions } = await requirePermission(ctx, user, args.id, "edit");
+    const path = await keyPath(ctx, user, item);
 
-    if (!access) {
-      throw new ConvexError("Bu parolaya erişimin yok.");
+    if (!path) {
+      throw new ConvexError("Bu parolanın anahtarı henüz sende yok; birazdan tekrar dene.");
     }
 
     return {
-      item: serialize(item, { kind: "direct", access: access.access }, user._id),
+      item: serialize(item, path, user._id, permissions),
       history: await historyRecords(ctx, item._id),
-      ...(await rekeyRecipients(ctx, item, user._id)),
+      ...(await rekeyRecipients(ctx, item)),
     };
   },
 });
@@ -855,14 +945,19 @@ export const pendingWork = query({
 
       const { recipients, currentUsers, departments } = await keyTargets(ctx, item);
 
-      const serialized = serialize(item, { kind: "direct", access: access.access }, user._id);
+      const serialized = serialize(
+        item,
+        { kind: "direct", access: access.access },
+        user._id,
+        await itemPermissions(ctx, user, item),
+      );
 
       if (item.needsRekey) {
         if (item.ownerId === user._id) {
           rekeys.push({
             item: serialized,
             history: await historyRecords(ctx, item._id),
-            ...(await rekeyRecipients(ctx, item, user._id)),
+            ...(await rekeyRecipients(ctx, item)),
           });
         }
 
