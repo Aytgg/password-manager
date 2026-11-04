@@ -21,6 +21,7 @@ function toEncryptedItem(item: ServerItem) {
     ownerId: item.ownerId,
     metadata: item.metadata,
     secret: item.secret,
+    history: item.history,
     access: item.access,
   };
 }
@@ -231,6 +232,7 @@ export default function KeySync({ enabled, serverPublicKey, onError }: Props) {
         const rekeyed = await invoke<{
           metadata: ServerItem["metadata"];
           secret: ServerItem["secret"];
+          history: ServerItem["history"];
           accesses: UserAccess[];
           departmentAccesses: DepartmentAccess[];
         }>("rekey_item", {

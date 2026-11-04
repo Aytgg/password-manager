@@ -86,6 +86,7 @@ function serialize(
     isOwner: item.ownerId === userId,
     metadata: item.metadata,
     secret: item.secret,
+    history: item.history ?? null,
     keyVersion: item.keyVersion,
     createdAt: item.createdAt,
     updatedAt: item.updatedAt,
@@ -540,6 +541,7 @@ export const rekey = mutation({
     keyVersion: v.number(),
     metadata: sealedField,
     secret: sealedField,
+    history: v.optional(v.union(sealedField, v.null())),
     accesses: v.array(userAccess),
     departmentAccesses: v.array(departmentAccess),
   },
@@ -550,6 +552,15 @@ export const rekey = mutation({
     requireKeyVersion(item, args.keyVersion);
     assertSealedField(args.metadata);
     assertSealedField(args.secret);
+
+    const history = args.history ?? undefined;
+
+    if (history) {
+      assertSealedField(history);
+    } else if (item.history) {
+      // Geçmişi tanımayan eski bir istemci rekey yaparsa geçmiş kaybolmasın.
+      throw new ConvexError("Parola geçmişi eksik. Uygulamayı güncelleyip tekrar dene.");
+    }
 
     const recipients = await directRecipients(ctx, item);
     const { departmentIds } = await itemGrants(ctx, item._id);
@@ -599,6 +610,7 @@ export const rekey = mutation({
     await ctx.db.patch(item._id, {
       metadata: args.metadata,
       secret: args.secret,
+      history,
       keyVersion: item.keyVersion + 1,
       needsRekey: false,
       updatedAt: Date.now(),

@@ -631,6 +631,45 @@ describe("kişiye paylaşım ve rekey", () => {
     await expect(as("bob").mutation(api.items.create, payload)).rejects.toThrow(/zaten kullanılıyor/);
   });
 
+  test("parola geçmişi rekey ile saklanır, erişimi olanlara gelir ve kaybedilemez", async () => {
+    const { ids, uid, as, runDepartmentWork, createItem, shareWithDepartment, getItem } = await setup();
+    await runDepartmentWork();
+
+    const id = await createItem("alice");
+    await shareWithDepartment("alice", id, ids.satis);
+
+    const keyVersion = async () => (await getItem(id))!.keyVersion;
+
+    await as("alice").mutation(api.items.rekey, {
+      id,
+      keyVersion: await keyVersion(),
+      metadata: sealed(5),
+      secret: sealed(6),
+      history: sealed(9),
+      accesses: [{ userId: uid("alice"), access: wrapped(7) }],
+      departmentAccesses: [{ departmentId: ids.satis, keyVersion: 1, access: wrapped(8) }],
+    });
+
+    const carolItems = await as("carol").query(api.items.listMine, {});
+    expect(carolItems.find((item) => item.id === id)?.history).toEqual(sealed(9));
+
+    // Geçmişi göndermeyen (eski) istemci geçmişi silemez.
+    for (const history of [undefined, null]) {
+      await expect(
+        as("alice").mutation(api.items.rekey, {
+          id,
+          keyVersion: await keyVersion(),
+          metadata: sealed(5),
+          secret: sealed(6),
+          ...(history === undefined ? {} : { history }),
+          accesses: [{ userId: uid("alice"), access: wrapped(7) }],
+          departmentAccesses: [{ departmentId: ids.satis, keyVersion: 1, access: wrapped(8) }],
+        }),
+      ).rejects.toThrow(/geçmişi eksik/);
+    }
+    expect((await getItem(id))!.history).toEqual(sealed(9));
+  });
+
   test("rekey beklerken eski anahtar dağıtılmaz", async () => {
     const { uid, as, createItem, shareWithUser } = await setup();
     const id = await createItem("alice");

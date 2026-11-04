@@ -507,6 +507,38 @@ fn copy_item_password_to_clipboard(
         items::decrypt_secret(identity, &item)
     })?;
 
+    copy_secret_to_clipboard(app, plaintext_bytes)
+}
+
+/// Parolanın eski değerlerinin değiştirilme zamanları (en yenisi önce).
+/// Eski parolalar çözülmez.
+#[tauri::command]
+fn item_password_history(
+    session: tauri::State<'_, Arc<VaultSession>>,
+    item: EncryptedItem,
+) -> Result<Vec<items::HistoryInfo>, String> {
+    session.with_identity(|identity, _| items::history_summary(identity, &item))
+}
+
+/// Geçmişteki bir parolayı Rust tarafında çözer ve panoya yazar.
+#[tauri::command]
+fn copy_item_history_password_to_clipboard(
+    app: tauri::AppHandle,
+    session: tauri::State<'_, Arc<VaultSession>>,
+    item: EncryptedItem,
+    index: usize,
+) -> Result<(), String> {
+    let plaintext_bytes = session.with_identity(|identity, _| {
+        items::decrypt_history_password(identity, &item, index)
+    })?;
+
+    copy_secret_to_clipboard(app, plaintext_bytes)
+}
+
+fn copy_secret_to_clipboard(
+    app: tauri::AppHandle,
+    plaintext_bytes: Zeroizing<Vec<u8>>,
+) -> Result<(), String> {
     let plaintext_str = std::str::from_utf8(plaintext_bytes.as_slice())
         .map_err(|_| "Parola geçerli UTF-8 metni değil.".to_string())?;
 
@@ -699,6 +731,8 @@ pub fn run() {
             encrypt_new_item,
             decrypt_items_metadata,
             copy_item_password_to_clipboard,
+            item_password_history,
+            copy_item_history_password_to_clipboard,
             wrap_item_key_for_recipient,
             rekey_item,
             edit_item,

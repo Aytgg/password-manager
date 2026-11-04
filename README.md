@@ -152,16 +152,24 @@ etkilenmez.
 
 ## Kayıtların şifrelenmesi
 
-Her kaydın kendine ait rastgele bir **DEK**'i (32 bayt) vardır. Kayıt iki ayrı
-şifreli alan taşır:
+Her kaydın kendine ait rastgele bir **DEK**'i (32 bayt) vardır. Kayıt en çok
+üç ayrı şifreli alan taşır:
 
 | Alan | İçerik | AAD |
 |---|---|---|
 | `metadata` | `{ "title", "username" }` JSON | `password-manager/item/v1/metadata:{sahipId}:{kayıtId}` |
 | `secret` | Parola baytları | `password-manager/item/v1/secret:{sahipId}:{kayıtId}` |
+| `history` (isteğe bağlı) | Eski parolalar: `[{ "password" (base64), "replacedAt" }]` JSON | `password-manager/item/v1/history:{sahipId}:{kayıtId}` |
 
 Alanların ayrı olması sayesinde liste görüntülenirken parolaların kendisi
-çözülmez. AAD şifreli veriyi sahibine ve kayıt kimliğine bağlar: sunucu bir
+çözülmez.
+
+Parola değiştirildiğinde eski değer `history` alanına eklenir (en çok 20
+kayıt ve 10 KB; sığmayan en eskiler düşülür). Geçmiş aynı DEK ile
+şifrelendiği için parolayı açabilen herkes geçmişini de açabilir. Her rekey'de
+geçmiş de yeni DEK'e taşınır, böylece erişimi kaldırılan kişi geçmişi de
+açamaz. Sunucu, geçmişi olan bir kaydın geçmişsiz rekey'ini reddeder. Eski
+parolalar da güncel parola gibi yalnızca panoya kopyalanır. AAD şifreli veriyi sahibine ve kayıt kimliğine bağlar: sunucu bir
 kaydın şifreli verisini başka bir kayda taşırsa çözme başarısız olur.
 
 Kayıt kimliği (`item-<32 hex>`) istemcide rastgele üretilir. Bu sayede

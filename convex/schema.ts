@@ -78,6 +78,8 @@ export default defineSchema({
     ownerId: v.id("users"),
     metadata: sealedField,
     secret: sealedField,
+    // Eski parolalar; aynı DEK ile şifreli. Parola hiç değişmediyse yok.
+    history: v.optional(sealedField),
     keyVersion: v.number(),
     needsRekey: v.boolean(),
     createdAt: v.number(),

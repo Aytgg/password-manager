@@ -317,9 +317,116 @@ function SharingPanel({
   );
 }
 
+type PanelKind = "sharing" | "edit" | "history";
+
+type HistoryInfo = { index: number; replacedAt: number };
+
+const historyDateFormat = new Intl.DateTimeFormat("tr-TR", {
+  dateStyle: "medium",
+  timeStyle: "short",
+});
+
+/**
+ * Parolanın eski değerleri. Parolayı açabilen herkes görür; liste yalnızca
+ * değiştirilme zamanlarını gösterir, eski parolalar da güncel parola gibi
+ * yalnızca panoya kopyalanır (açık metin React'e gelmez).
+ */
+function PasswordHistoryPanel({ item, onCopied }: { item: VaultItem; onCopied: () => void }) {
+  const [entries, setEntries] = useState<HistoryInfo[] | null>(null);
+  const [copyingIndex, setCopyingIndex] = useState<number | null>(null);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    let cancelled = false;
+    setEntries(null);
+
+    invoke<HistoryInfo[]>("item_password_history", { item: item.encrypted })
+      .then((result) => {
+        if (!cancelled) setEntries(result);
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) setError(errorMessage(err));
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [item.encrypted]);
+
+  async function handleCopy(index: number) {
+    if (copyingIndex !== null) return;
+
+    setCopyingIndex(index);
+    setError("");
+
+    try {
+      await invoke("copy_item_history_password_to_clipboard", { item: item.encrypted, index });
+      onCopied();
+    } catch (err) {
+      setError(errorMessage(err));
+    } finally {
+      setCopyingIndex(null);
+    }
+  }
+
+  return (
+    <div>
+      <strong>Parola geçmişi</strong>
+
+      {error && (
+        <p role="alert" style={styles.error}>
+          {error}
+        </p>
+      )}
+
+      {entries === null ? (
+        !error && <p style={styles.muted}>Geçmiş yükleniyor...</p>
+      ) : entries.length === 0 ? (
+        <p style={styles.muted}>Bu parola hiç değiştirilmemiş.</p>
+      ) : (
+        <div style={{ display: "grid", gap: 8, marginTop: 12 }}>
+          {entries.map((entry, position) => (
+            <div
+              key={entry.index}
+              style={{
+                display: "flex",
+                justifyContent: "space-between",
+                alignItems: "center",
+                gap: 12,
+                flexWrap: "wrap",
+              }}
+            >
+              <span style={{ fontSize: 13 }}>
+                {position === 0 ? "Bir önceki parola" : `${position + 1} önceki parola`}
+                <span style={{ ...styles.muted, marginLeft: 8 }}>
+                  {historyDateFormat.format(new Date(entry.replacedAt))} tarihinde değiştirildi
+                </span>
+              </span>
+
+              <button
+                type="button"
+                style={{
+                  ...styles.secondaryButton,
+                  opacity: copyingIndex !== null ? 0.6 : 1,
+                  cursor: copyingIndex !== null ? "wait" : "pointer",
+                }}
+                onClick={() => void handleCopy(entry.index)}
+                disabled={copyingIndex !== null}
+              >
+                {copyingIndex === entry.index ? "Kopyalanıyor..." : "Kopyala"}
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
 type RekeyedItem = {
   metadata: SealedField;
   secret: SealedField;
+  history: SealedField | null;
   accesses: { userId: Id<"users">; access: WrappedKey }[];
   departmentAccesses: { departmentId: Id<"departments">; keyVersion: number; access: WrappedKey }[];
 };
@@ -588,10 +695,10 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
   // Bir kartta aynı anda tek panel açık olur: yetkilendirme ya da düzenleme.
   const [openPanel, setOpenPanel] = useState<{
     itemId: string;
-    kind: "sharing" | "edit";
+    kind: PanelKind;
   } | null>(null);
 
-  const togglePanel = (itemId: string, kind: "sharing" | "edit") =>
+  const togglePanel = (itemId: string, kind: PanelKind) =>
     setOpenPanel((current) =>
       current?.itemId === itemId && current.kind === kind ? null : { itemId, kind },
     );
@@ -835,6 +942,9 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
               openPanel?.itemId === itemId && openPanel.kind === "sharing";
             const canEdit = isOnline && id !== null && item.decrypted;
             const isEditOpen = canEdit && openPanel?.itemId === itemId && openPanel.kind === "edit";
+            const hasHistory = item.vault.encrypted.history !== null;
+            const isHistoryOpen =
+              hasHistory && openPanel?.itemId === itemId && openPanel.kind === "history";
 
             return (
               <article key={itemId} style={styles.card}>
@@ -889,6 +999,20 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
                       {copyingPasswordId === itemId ? "Kopyalanıyor..." : "Parolayı kopyala"}
                     </button>
 
+                    {hasHistory && (
+                      <button
+                        type="button"
+                        style={{
+                          ...styles.secondaryButton,
+                          background: isHistoryOpen ? "#4b5563" : styles.secondaryButton.background,
+                        }}
+                        onClick={() => togglePanel(itemId, "history")}
+                        aria-expanded={isHistoryOpen}
+                      >
+                        Geçmiş
+                      </button>
+                    )}
+
                     {isOwner && (
                       <button
                         type="button"
@@ -921,6 +1045,26 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
                     )}
                   </div>
                 </div>
+
+                {isHistoryOpen && (
+                  <div
+                    style={{
+                      marginTop: 18,
+                      paddingTop: 16,
+                      borderTop: "1px solid #353b48",
+                    }}
+                  >
+                    <PasswordHistoryPanel
+                      item={item.vault}
+                      onCopied={() => {
+                        setError("");
+                        setSuccess(
+                          "Eski parola panoya kopyalandı. 30 saniye sonra otomatik temizlenmesi denenecek.",
+                        );
+                      }}
+                    />
+                  </div>
+                )}
 
                 {isEditOpen && id !== null && (
                   <div
