@@ -533,3 +533,14 @@ cd src-tauri && cargo test   # Rust kriptografi ve kasa testleri
 | `src-tauri/src/storage/` | Stronghold anahtar deposu ve kimlik anahtarları |
 | `convex/` | Şema, erişim kuralları, kimlik doğrulama, anahtar iş listeleri ve testler |
 | `src/` | React arayüzü, arka plan anahtar eşitlemesi (`KeySync`), çevrimdışı veri katmanı (`vaultData`) |
+
+## Lisans
+
+[PolyForm Noncommercial 1.0.0](LICENSE). Kişisel ve ticari olmayan kullanım
+serbesttir; değiştirip yeniden paylaşabilirsin. Ticari kullanım için izin
+gerekir. Kodu ya da değiştirilmiş halini paylaşan herkes lisans metnini ve şu
+satırı korumak zorundadır:
+
+```
+Required Notice: Copyright (c) 2026 Aytuğ DEĞER (https://github.com/Aytgg)
+```

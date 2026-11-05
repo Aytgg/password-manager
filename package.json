@@ -11,8 +11,8 @@
     "tauri": "tauri"
   },
   "keywords": [],
-  "author": "",
-  "license": "ISC",
+  "author": "Aytuğ DEĞER",
+  "license": "PolyForm-Noncommercial-1.0.0",
   "type": "module",
   "devDependencies": {
     "@edge-runtime/vm": "^5.0.0",
