@@ -380,4 +380,44 @@ describe("uçtan uca: departman üzerinden paylaşım", () => {
     expect(await view(carol, item, adminId)).toEqual({ visible: true, via: "department", pending: 0, hasKey: true });
     expect((await view(dave, item, adminId)).visible).toBe(false);
   });
+
+  test("departmanı üzerinden tam yetkili kişi başkasına yetki verir; sahip ve yönetici çevrimdışı", async () => {
+    const { adminId, asId, open, invite, register, createItem, view } = await world();
+    const admin = asId(adminId);
+
+    await open(adminId);
+    const yazilim = await admin.mutation(api.departments.create, { name: "Yazılım" });
+    const destek = await admin.mutation(api.departments.create, { name: "Destek" });
+    const satis = await admin.mutation(api.departments.create, { name: "Satış" });
+    const sw = await invite("sw@vs.com", yazilim);
+    const destek2 = await invite("destek2@vs.com", destek);
+    const carol = await invite("carol@vs.com", satis);
+    await open(adminId);
+    for (const user of [sw, destek2, carol]) {
+      await register(user);
+      await open(user);
+    }
+
+    const item = await createItem(sw);
+    await asId(sw).mutation(api.items.setDepartmentGrant, {
+      id: item,
+      departmentId: destek,
+      granted: true,
+      permissions: { edit: true, delete: true, share: true },
+    });
+    await open(sw);
+    // Sahip ve yönetici bundan sonra çevrimdışı.
+
+    await asId(destek2).mutation(api.items.setUserGrant, { id: item, userId: carol, granted: true });
+    await asId(destek2).mutation(api.items.setDepartmentGrant, { id: item, departmentId: satis, granted: true });
+    await open(destek2);
+
+    expect(await view(carol, item, destek2)).toEqual({ visible: true, via: "direct", pending: 0, hasKey: true });
+
+    // Kişisel yetkiyi kaldırınca (yeniden şifreleme gerekir) departman
+    // üzerinden yine görür.
+    await asId(destek2).mutation(api.items.setUserGrant, { id: item, userId: carol, granted: false });
+    await open(destek2);
+    expect(await view(carol, item, destek2)).toEqual({ visible: true, via: "department", pending: 0, hasKey: true });
+  });
 });

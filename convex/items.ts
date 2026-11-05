@@ -179,6 +179,49 @@ async function keyPath(ctx: QueryCtx, user: Doc<"users">, item: Doc<"items">): P
   return null;
 }
 
+/** Kullanıcının açabildiği bütün kayıtlar ve her birine ulaşma yolu:
+ * doğrudan paket ya da departmanının güncel anahtarı (doğrudan olan
+ * öncelikli). */
+async function accessibleItems(ctx: QueryCtx, user: Doc<"users">) {
+  const results = new Map<Id<"items">, { item: Doc<"items">; path: KeyPath }>();
+
+  for (const access of await ctx.db
+    .query("itemAccess")
+    .withIndex("by_user", (q) => q.eq("userId", user._id))
+    .collect()) {
+    const item = await ctx.db.get(access.item);
+
+    if (item) {
+      results.set(item._id, { item, path: { kind: "direct", access: access.access } });
+    }
+  }
+
+  const department = user.departmentId ? await ctx.db.get(user.departmentId) : null;
+  const departmentKey = department ? await currentDepartmentKey(ctx, department, user._id) : null;
+
+  if (department && departmentKey) {
+    for (const row of await ctx.db
+      .query("itemDepartmentAccess")
+      .withIndex("by_department", (q) => q.eq("department", department._id))
+      .collect()) {
+      if (row.keyVersion !== department.keyVersion || results.has(row.item)) {
+        continue;
+      }
+
+      const item = await ctx.db.get(row.item);
+
+      if (item) {
+        results.set(item._id, {
+          item,
+          path: { kind: "department", departmentKey: departmentKey.access, itemKey: row.access },
+        });
+      }
+    }
+  }
+
+  return [...results.values()];
+}
+
 /**
  * Kaydın geçmişi; kaydı açabilen herkes görebilir. Geçmiş kayıtları
  * kaydın DEK'i ile şifreli olduğu için ulaşma yolu da birlikte döner.
@@ -209,60 +252,16 @@ export const listMine = query({
   args: {},
   handler: async (ctx) => {
     const user = await requireActiveUser(ctx);
-    const results = new Map<Id<"items">, ReturnType<typeof serialize>>();
+    const results = [];
 
-    for (const access of await ctx.db
-      .query("itemAccess")
-      .withIndex("by_user", (q) => q.eq("userId", user._id))
-      .collect()) {
-      const item = await ctx.db.get(access.item);
-
-      if (item) {
-        const permissions = await itemPermissions(ctx, user, item);
-        results.set(
-          item._id,
-          serialize(
-            item,
-            { kind: "direct", access: access.access },
-            user._id,
-            permissions,
-            await grantList(ctx, item, permissions),
-          ),
-        );
-      }
+    for (const { item, path } of await accessibleItems(ctx, user)) {
+      const permissions = await itemPermissions(ctx, user, item);
+      results.push(
+        serialize(item, path, user._id, permissions, await grantList(ctx, item, permissions)),
+      );
     }
 
-    const department = user.departmentId ? await ctx.db.get(user.departmentId) : null;
-    const departmentKey = department ? await currentDepartmentKey(ctx, department, user._id) : null;
-
-    if (department && departmentKey) {
-      for (const row of await ctx.db
-        .query("itemDepartmentAccess")
-        .withIndex("by_department", (q) => q.eq("department", department._id))
-        .collect()) {
-        if (row.keyVersion !== department.keyVersion || results.has(row.item)) {
-          continue;
-        }
-
-        const item = await ctx.db.get(row.item);
-
-        if (item) {
-          const permissions = await itemPermissions(ctx, user, item);
-          results.set(
-            item._id,
-            serialize(
-              item,
-              { kind: "department", departmentKey: departmentKey.access, itemKey: row.access },
-              user._id,
-              permissions,
-              await grantList(ctx, item, permissions),
-            ),
-          );
-        }
-      }
-    }
-
-    return [...results.values()];
+    return results;
   },
 });
 
@@ -672,7 +671,9 @@ export const addAccesses = mutation({
     const user = await requireActiveUser(ctx);
     const item = await ctx.db.get(args.id);
 
-    if (!item || !(await myAccess(ctx, args.id, user._id))) {
+    // Kaydı açabilen herkes (departmanı üzerinden açan dahil) kurala göre
+    // eksik paketleri üretebilir; kimin alacağına kural karar verir.
+    if (!item || !(await keyPath(ctx, user, item))) {
       throw new ConvexError("Bu parolaya erişimin yok.");
     }
 
@@ -936,7 +937,8 @@ export const editTargets = query({
 
 /**
  * Kayıtlarla ilgili, istemcinin arka planda yapması gereken şifreleme işleri:
- * - fills: doğrudan erişimim olan kayıtlarda, kurala göre paketi eksik
+ * - fills: açabildiğim (doğrudan ya da departmanım üzerinden) kayıtlarda,
+ *   kurala göre paketi eksik
  *   kullanıcılar ve departmanlar (paketleri ben üretirim).
  * - rekeys: düzenleyebildiğim ve erişimi kaldırılmış kayıtlar (yeni DEK).
  */
@@ -948,25 +950,11 @@ export const pendingWork = query({
     const fills = [];
     const rekeys = [];
 
-    for (const access of await ctx.db
-      .query("itemAccess")
-      .withIndex("by_user", (q) => q.eq("userId", user._id))
-      .collect()) {
-      const item = await ctx.db.get(access.item);
-
-      if (!item) {
-        continue;
-      }
-
+    for (const { item, path } of await accessibleItems(ctx, user)) {
       const { recipients, currentUsers, departments } = await keyTargets(ctx, item);
 
       const permissions = await itemPermissions(ctx, user, item);
-      const serialized = serialize(
-        item,
-        { kind: "direct", access: access.access },
-        user._id,
-        permissions,
-      );
+      const serialized = serialize(item, path, user._id, permissions);
 
       if (item.needsRekey) {
         // Sahip, yöneticiler ve düzenleme yetkisi olanlar yapabilir; sahibin
