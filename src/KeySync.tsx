@@ -81,6 +81,26 @@ function useWorker<T>(
   }, [work, tick]);
 }
 
+/**
+ * İşleri birbirinden bağımsız çalıştırır: biri hata verirse (ör. çözülemeyen
+ * bir kayıt) diğerleri yine yapılır. Hatalar sonunda tek mesajda bildirilir.
+ */
+async function eachTask<T>(tasks: T[], describe: (task: T) => string, run: (task: T) => Promise<void>) {
+  const failures: string[] = [];
+
+  for (const task of tasks) {
+    try {
+      await run(task);
+    } catch (error) {
+      failures.push(`${describe(task)}: ${errorMessage(error)}`);
+    }
+  }
+
+  if (failures.length > 0) {
+    throw new Error(failures.join(" · "));
+  }
+}
+
 type Props = {
   /** Sunucu oturumu açık ve kasanın sahibiyle eşleşiyor. */
   enabled: boolean;
@@ -181,45 +201,52 @@ export default function KeySync({ enabled, serverPublicKey, onError }: Props) {
     departmentWork,
     (work) => work.inits.length + work.fills.length + work.rotations.length === 0,
     async (work) => {
-      for (const task of work.inits) {
-        const created = await invoke<{ publicKey: string; accesses: UserAccess[] }>(
-          "create_department_key",
-          { holders: task.holders },
-        );
+      const tasks = [
+        ...work.inits.map((task) => ({ kind: "init" as const, task })),
+        ...work.fills.map((task) => ({ kind: "fill" as const, task })),
+        ...work.rotations.map((task) => ({ kind: "rotation" as const, task })),
+      ];
 
-        await initDepartmentKey({ departmentId: task.departmentId, ...created });
-      }
+      await eachTask(tasks, (entry) => `departman ${entry.task.departmentId}`, async (entry) => {
+        if (entry.kind === "init") {
+          const task = entry.task;
+          const created = await invoke<{ publicKey: string; accesses: UserAccess[] }>(
+            "create_department_key",
+            { holders: task.holders },
+          );
 
-      for (const task of work.fills) {
-        const accesses = await invoke<UserAccess[]>("wrap_department_key", {
-          key: task.key,
-          recipients: task.recipients,
-        });
+          await initDepartmentKey({ departmentId: task.departmentId, ...created });
+        } else if (entry.kind === "fill") {
+          const task = entry.task;
+          const accesses = await invoke<UserAccess[]>("wrap_department_key", {
+            key: task.key,
+            recipients: task.recipients,
+          });
 
-        await addDepartmentKeys({
-          departmentId: task.departmentId,
-          keyVersion: task.keyVersion,
-          accesses,
-        });
-      }
+          await addDepartmentKeys({
+            departmentId: task.departmentId,
+            keyVersion: task.keyVersion,
+            accesses,
+          });
+        } else {
+          const task = entry.task;
+          const rotated = await invoke<{
+            publicKey: string;
+            accesses: UserAccess[];
+            itemKeys: { item: Id<"items">; access: WrappedKey }[];
+          }>("rotate_department_key", {
+            key: task.key,
+            holders: task.holders,
+            itemKeys: task.itemKeys,
+          });
 
-      for (const task of work.rotations) {
-        const rotated = await invoke<{
-          publicKey: string;
-          accesses: UserAccess[];
-          itemKeys: { item: Id<"items">; access: WrappedKey }[];
-        }>("rotate_department_key", {
-          key: task.key,
-          holders: task.holders,
-          itemKeys: task.itemKeys,
-        });
-
-        await rotateDepartmentKey({
-          departmentId: task.departmentId,
-          keyVersion: task.keyVersion,
-          ...rotated,
-        });
-      }
+          await rotateDepartmentKey({
+            departmentId: task.departmentId,
+            keyVersion: task.keyVersion,
+            ...rotated,
+          });
+        }
+      });
     },
     (message) => onError(`Departman anahtarı eşitlenemedi: ${message}`),
   );
@@ -228,7 +255,10 @@ export default function KeySync({ enabled, serverPublicKey, onError }: Props) {
     itemWork,
     (work) => work.fills.length + work.rekeys.length === 0,
     async (work) => {
-      for (const task of work.rekeys) {
+      const describe = (task: { item: ServerItem }) => `kayıt ${task.item.id}`;
+      const errors: string[] = [];
+
+      await eachTask(work.rekeys, describe, async (task) => {
         const rekeyed = await invoke<{
           metadata: ServerItem["metadata"];
           secret: ServerItem["secret"];
@@ -243,21 +273,28 @@ export default function KeySync({ enabled, serverPublicKey, onError }: Props) {
         });
 
         await rekeyItem({ id: task.item.id, keyVersion: task.item.keyVersion, ...rekeyed });
-      }
+      }).catch((error: unknown) => errors.push(errorMessage(error)));
 
-      for (const task of work.fills) {
+      await eachTask(work.fills, describe, async (task) => {
         const item = toEncryptedItem(task.item);
         const accesses: UserAccess[] = [];
         const departmentAccesses: DepartmentAccess[] = [];
+        const skipped: string[] = [];
 
+        // Açık anahtarı bozuk bir alıcı, diğer alıcıları ve departmanları
+        // engellemez.
         for (const recipient of task.recipients) {
-          accesses.push({
-            userId: recipient.userId,
-            access: await invoke<WrappedKey>("wrap_item_key_for_recipient", {
-              item,
-              recipientPublicKey: recipient.publicKey,
-            }),
-          });
+          try {
+            accesses.push({
+              userId: recipient.userId,
+              access: await invoke<WrappedKey>("wrap_item_key_for_recipient", {
+                item,
+                recipientPublicKey: recipient.publicKey,
+              }),
+            });
+          } catch (error) {
+            skipped.push(`kullanıcı ${recipient.userId}: ${errorMessage(error)}`);
+          }
         }
 
         for (const department of task.departments) {
@@ -271,12 +308,22 @@ export default function KeySync({ enabled, serverPublicKey, onError }: Props) {
           });
         }
 
-        await addAccesses({
-          id: task.item.id,
-          keyVersion: task.item.keyVersion,
-          accesses,
-          departmentAccesses,
-        });
+        if (accesses.length + departmentAccesses.length > 0) {
+          await addAccesses({
+            id: task.item.id,
+            keyVersion: task.item.keyVersion,
+            accesses,
+            departmentAccesses,
+          });
+        }
+
+        if (skipped.length > 0) {
+          throw new Error(skipped.join(", "));
+        }
+      }).catch((error: unknown) => errors.push(errorMessage(error)));
+
+      if (errors.length > 0) {
+        throw new Error(errors.join(" · "));
       }
     },
     (message) => onError(`Anahtar paylaşımı başarısız: ${message}`),
