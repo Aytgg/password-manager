@@ -496,10 +496,9 @@ export default function AdminPanel({ me }: { me: Me }) {
               const { expiresAt } = await inviteMember({
                 email: inviteEmail,
                 role: inviteRole,
+                // Yöneticiler departmansızdır.
                 departmentId:
-                  inviteRole === "admin" && !inviteDepartmentId
-                    ? undefined
-                    : (inviteDepartmentId as Id<"departments">),
+                  inviteRole === "admin" ? undefined : (inviteDepartmentId as Id<"departments">),
                 publicKey: prepared.publicKey,
                 verifier: prepared.verifier,
                 expiresInHours: inviteHours,
@@ -528,10 +527,12 @@ export default function AdminPanel({ me }: { me: Me }) {
             value={inviteDepartmentId}
             onChange={(event) => setInviteDepartmentId(event.target.value)}
             aria-label="Departman"
-            disabled={!isAdmin}
+            disabled={!isAdmin || inviteRole === "admin"}
             required={inviteRole !== "admin"}
           >
-            <option value="">Departman seç</option>
+            <option value="">
+              {inviteRole === "admin" ? "Yöneticiler departmansızdır" : "Departman seç"}
+            </option>
             {departments?.map((department) => (
               <option key={department.id} value={department.id}>
                 {department.name}
@@ -543,7 +544,11 @@ export default function AdminPanel({ me }: { me: Me }) {
             <select
               style={styles.input}
               value={inviteRole}
-              onChange={(event) => setInviteRole(event.target.value as Role)}
+              onChange={(event) => {
+                const role = event.target.value as Role;
+                setInviteRole(role);
+                if (role === "admin") setInviteDepartmentId("");
+              }}
               aria-label="Rol"
             >
               <option value="member">{ROLE_LABELS.member}</option>
@@ -678,8 +683,9 @@ export default function AdminPanel({ me }: { me: Me }) {
                 <div style={styles.row}>
                   <select
                     style={styles.input}
-                    value={member.departmentId ?? ""}
-                    disabled={busy || !member.canManage || !isAdmin}
+                    value={member.role === "admin" ? "" : (member.departmentId ?? "")}
+                    disabled={busy || !member.canManage || !isAdmin || member.role === "admin"}
+                    title={member.role === "admin" ? "Yöneticiler departmansızdır" : undefined}
                     aria-label={`${member.email} departmanı`}
                     onChange={(event) =>
                       void run(
@@ -692,7 +698,9 @@ export default function AdminPanel({ me }: { me: Me }) {
                       )
                     }
                   >
-                    {member.departmentId === null && <option value="">—</option>}
+                    {(member.role === "admin" || member.departmentId === null) && (
+                      <option value="">{member.role === "admin" ? "Departman yok" : "—"}</option>
+                    )}
                     {departments?.map((department) => (
                       <option key={department.id} value={department.id}>
                         {department.name}
@@ -705,16 +713,27 @@ export default function AdminPanel({ me }: { me: Me }) {
                     value={member.role}
                     disabled={busy || !member.canManage || !isAdmin}
                     aria-label={`${member.email} rolü`}
-                    onChange={(event) =>
+                    onChange={(event) => {
+                      const role = event.target.value as Role;
+                      // Yöneticilikten alınan kişiye bir departman gerekir;
+                      // ilk departman atanır, sonra değiştirilebilir.
+                      const department =
+                        member.role === "admin" && role !== "admin" ? departments?.[0] : undefined;
+
                       void run(
-                        () =>
-                          updateMember({
-                            id: member.id,
-                            role: event.target.value as Role,
-                          }),
-                        "Rol güncellendi.",
-                      )
-                    }
+                        async () => {
+                          if (member.role === "admin" && role !== "admin" && !department) {
+                            throw new Error("Önce bir departman oluştur.");
+                          }
+                          await updateMember({ id: member.id, role, departmentId: department?.id });
+                        },
+                        department
+                          ? `Rol güncellendi; departmanı ${department.name} olarak atandı, gerekirse değiştir.`
+                          : role === "admin"
+                            ? "Rol güncellendi; yöneticiler departmansız olduğu için departmanı kaldırıldı."
+                            : "Rol güncellendi.",
+                      );
+                    }}
                   >
                     <option value="member">{ROLE_LABELS.member}</option>
                     <option value="manager">{ROLE_LABELS.manager}</option>

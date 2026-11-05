@@ -44,10 +44,13 @@ async function checkInvite(
     throw new ConvexError("Kullanıcı davet etme yetkin yok.");
   }
 
-  if (args.role !== "admin") {
-    if (!args.departmentId || !(await ctx.db.get(args.departmentId))) {
-      throw new ConvexError("Bir departman seçilmeli.");
+  // Yöneticiler departmansızdır; diğer herkesin bir departmanı olmalı.
+  if (args.role === "admin") {
+    if (args.departmentId) {
+      throw new ConvexError("Yöneticiler bir departmana bağlı olamaz.");
     }
+  } else if (!args.departmentId || !(await ctx.db.get(args.departmentId))) {
+    throw new ConvexError("Bir departman seçilmeli.");
   }
 
   const existing = await ctx.db
@@ -227,12 +230,17 @@ export const update = mutation({
     }
 
     const nextRole = args.role ?? target.role;
-    const nextDepartmentId = args.departmentId ?? target.departmentId;
+    let nextDepartmentId = args.departmentId ?? target.departmentId;
 
-    if (nextRole !== "admin") {
-      if (!nextDepartmentId || !(await ctx.db.get(nextDepartmentId))) {
-        throw new ConvexError("Bir departman seçilmeli.");
+    // Yöneticiler departmansızdır: yönetici yapılan kişinin departmanı
+    // kaldırılır, yöneticiye departman atanamaz.
+    if (nextRole === "admin") {
+      if (args.departmentId) {
+        throw new ConvexError("Yöneticiler bir departmana bağlı olamaz.");
       }
+      nextDepartmentId = undefined;
+    } else if (!nextDepartmentId || !(await ctx.db.get(nextDepartmentId))) {
+      throw new ConvexError("Bir departman seçilmeli.");
     }
 
     let nextStatus = target.status;

@@ -1120,6 +1120,45 @@ describe("kullanıcı yönetimi", () => {
     expiresInHours: 168,
   });
 
+  test("yöneticiler departmansızdır", async () => {
+    const { t, ids, uid, as } = await setup();
+    const user = (name: "carol") => t.run((ctx) => ctx.db.get(uid(name)));
+
+    // Yönetici yapılan kişinin departmanı kalkar.
+    await as("admin").mutation(api.members.update, { id: uid("carol"), role: "admin" });
+    expect(await user("carol")).toMatchObject({ role: "admin" });
+    expect((await user("carol"))!.departmentId).toBeUndefined();
+
+    // Yöneticiye departman atanamaz.
+    await expect(
+      as("admin").mutation(api.members.update, { id: uid("carol"), departmentId: ids.satis }),
+    ).rejects.toThrow(/Yöneticiler bir departmana bağlı olamaz/);
+    await expect(
+      as("admin").mutation(api.members.update, {
+        id: uid("carol"),
+        role: "admin",
+        departmentId: ids.satis,
+      }),
+    ).rejects.toThrow(/Yöneticiler bir departmana bağlı olamaz/);
+
+    // Yöneticilikten alınırken departman seçilmeli.
+    await expect(
+      as("admin").mutation(api.members.update, { id: uid("carol"), role: "member" }),
+    ).rejects.toThrow(/Bir departman seçilmeli/);
+    await as("admin").mutation(api.members.update, {
+      id: uid("carol"),
+      role: "member",
+      departmentId: ids.satis,
+    });
+    expect(await user("carol")).toMatchObject({ role: "member", departmentId: ids.satis });
+
+    // Yönetici departmanla davet edilemez.
+    await expect(
+      as("admin").mutation(api.members.invite, invite("yeni@vs.com", "admin", ids.satis)),
+    ).rejects.toThrow(/Yöneticiler bir departmana bağlı olamaz/);
+    await as("admin").mutation(api.members.invite, invite("yeni@vs.com", "admin"));
+  });
+
   test("departman yöneticisi yalnızca kendi departmanındaki personeli devre dışı bırakabilir", async () => {
     const { t, ids, as } = await setup();
 
