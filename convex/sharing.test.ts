@@ -929,6 +929,53 @@ describe("ayrı yetkiler", () => {
     expect(await getItem(id)).toBeNull();
   });
 
+  test("departmanı üzerinden yetkilendiren, kendi departmanının kuralını değiştiremez", async () => {
+    const { ids, uid, as, runDepartmentWork, createItem, shareWithDepartment, visible } =
+      await setup();
+    await runDepartmentWork();
+    const id = await createItem("alice");
+    await shareWithDepartment("alice", id, ids.satis);
+    await as("alice").mutation(api.items.setDepartmentGrant, {
+      id,
+      departmentId: ids.satis,
+      granted: true,
+      permissions: { ...none, share: true },
+    });
+
+    // Carol (Satış) kendi erişimini kesemez, kuralı da değiştiremez.
+    await expect(
+      as("carol").mutation(api.items.setDepartmentGrant, {
+        id,
+        departmentId: ids.satis,
+        granted: false,
+      }),
+    ).rejects.toThrow(/Bağlı olduğun departmanın/);
+    await expect(
+      as("carol").mutation(api.items.setDepartmentGrant, {
+        id,
+        departmentId: ids.satis,
+        granted: true,
+        permissions: none,
+      }),
+    ).rejects.toThrow(/Bağlı olduğun departmanın/);
+    expect(await visible(uid("carol"))).toEqual([id]);
+
+    // Başka departmanı ve kişileri yetkilendirebilir.
+    await as("carol").mutation(api.items.setDepartmentGrant, {
+      id,
+      departmentId: ids.yazilim,
+      granted: true,
+    });
+    await as("carol").mutation(api.items.setUserGrant, { id, userId: uid("bob"), granted: true });
+
+    // Sahip her kuralı değiştirebilir.
+    await as("alice").mutation(api.items.setDepartmentGrant, {
+      id,
+      departmentId: ids.satis,
+      granted: false,
+    });
+  });
+
   test("yetkilendirici yalnız kendinde olan yetkileri verir", async () => {
     const { ids, uid, as, createItem, shareWithUser } = await setup();
     const id = await createItem("alice");

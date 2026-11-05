@@ -500,6 +500,21 @@ async function updateGrant(
   const { item, permissions: actor } = await requirePermission(ctx, user, itemId, "share");
   const full = item.ownerId === user._id || user.role === "admin";
 
+  // Kişi kendi erişimini dayandığı kuralı değiştiremez: kendi kuralı ya da
+  // bağlı olduğu departmanın kuralı.
+  if (
+    !full &&
+    ("userId" in target
+      ? target.userId === user._id
+      : user.departmentId !== undefined && target.departmentId === user.departmentId)
+  ) {
+    throw new ConvexError(
+      "userId" in target
+        ? "Kendi yetkini değiştiremezsin."
+        : "Bağlı olduğun departmanın yetkisini değiştiremezsin.",
+    );
+  }
+
   const existing = (
     await ctx.db
       .query("itemGrants")

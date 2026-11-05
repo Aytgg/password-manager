@@ -145,9 +145,11 @@ async function world() {
   /** Kullanıcı uygulamayı açar; arka plan işleri bitene kadar çalışır. */
   async function open(userId: Id<"users">) {
     for (let round = 0; round < 10; round++) {
-      const changed =
-        (await syncIdentity(userId)) | Number(await departmentWork(userId)) | Number(await itemWork(userId));
-      if (!changed) return;
+      // Hepsi her turda çalışır (kısa devre yok).
+      const identity = await syncIdentity(userId);
+      const departments = await departmentWork(userId);
+      const items = await itemWork(userId);
+      if (!identity && !departments && !items) return;
     }
     throw new Error("Arka plan işleri bitmedi.");
   }

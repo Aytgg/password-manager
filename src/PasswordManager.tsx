@@ -337,16 +337,22 @@ function AuthorizationColumn({
   item,
   data,
   isOnline,
+  me,
 }: {
   item: VaultItem | null;
   data: VaultData;
   isOnline: boolean;
+  /** Oturumdaki kullanıcı; çevrimdışıyken bilinmez. */
+  me: { role: string; departmentId: Id<"departments"> | null } | null;
 }) {
   const [search, setSearch] = useState("");
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
   const editable = item !== null && item.permissions.share && data.directory !== null;
   const actor = item?.permissions ?? { view: false, ...NO_EXTRA };
+  // Sahip ve yöneticiler dışındakiler, erişimlerinin dayandığı kuralı
+  // (bağlı oldukları departmanınkini) değiştiremez.
+  const full = item?.isOwner === true || me?.role === "admin";
 
   // Anahtar durumu (erişim açık mı, hazırlanıyor mu) yalnızca sunucudan
   // öğrenilebilir.
@@ -472,6 +478,7 @@ function AuthorizationColumn({
               : departments.map((department) => {
                   const target: GrantTarget = { kind: "department", departmentId: department.id };
                   const current = asPermissions(grantOf(grants, target));
+                  const ownDepartment = !full && me?.departmentId === department.id;
                   const granted = current.view;
                   const members = users.filter(
                     (user) => user.isAdmin !== true && user.departmentId === department.id,
@@ -491,8 +498,13 @@ function AuthorizationColumn({
                         <Checkbox
                           state={granted ? permissionState(current) : anyMember ? "mixed" : false}
                           label={`${department.name} departmanı için bütün yetkiler`}
+                          disabled={ownDepartment}
                           title={
-                            !granted && anyMember ? "Bazı üyelerine kişisel yetki verilmiş" : undefined
+                            ownDepartment
+                              ? "Bağlı olduğun departmanın yetkisini değiştiremezsin"
+                              : !granted && anyMember
+                                ? "Bazı üyelerine kişisel yetki verilmiş"
+                                : undefined
                           }
                           onChange={(value) => applyAll(target, value)}
                         />
@@ -512,6 +524,11 @@ function AuthorizationColumn({
                           name={`${department.name} departmanı`}
                           current={current}
                           actor={actor}
+                          locked={
+                            ownDepartment
+                              ? "Bağlı olduğun departmanın yetkisini değiştiremezsin"
+                              : undefined
+                          }
                           onChange={(next) => apply(target, next)}
                         />
                       )}
@@ -2032,6 +2049,7 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
         item={selectedFolder ? null : (selected?.vault ?? null)}
         data={data}
         isOnline={isOnline}
+        me={me ? { role: me.role, departmentId: me.departmentId } : null}
       />
     </div>
   );
