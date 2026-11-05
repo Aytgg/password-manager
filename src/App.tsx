@@ -761,7 +761,7 @@ function App() {
           </p>
         )}
 
-        {keySyncError && isServerReady && (
+        {!!keySyncError && isServerReady && (
           <p className="vault-form-error" role="alert">
             {keySyncError}
           </p>
