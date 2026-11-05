@@ -26,6 +26,8 @@ use crate::crypto::{
 
 const MAX_TITLE_CHARS: usize = 200;
 const MAX_USERNAME_CHARS: usize = 320;
+const MAX_URL_CHARS: usize = 2048;
+const MAX_NOTES_CHARS: usize = 10_000;
 const MAX_SECRET_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -126,6 +128,36 @@ pub struct RekeyedItem {
 pub struct ItemMetadata {
     pub title: String,
     pub username: Option<String>,
+    /// Eski kayıtlarda yoktur.
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+/// Boş ya da yalnızca boşluk olan değer yok sayılır.
+fn optional(value: Option<&str>, trim: bool) -> Option<String> {
+    value
+        .map(|value| if trim { value.trim() } else { value })
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+}
+
+impl ItemMetadata {
+    /// Kullanıcının girdiği değerlerden; notlardaki satır yapısı korunur.
+    pub fn from_input(
+        title: &str,
+        username: Option<&str>,
+        url: Option<&str>,
+        notes: Option<&str>,
+    ) -> Self {
+        Self {
+            title: title.trim().to_string(),
+            username: optional(username, true),
+            url: optional(url, true),
+            notes: optional(notes, false),
+        }
+    }
 }
 
 fn new_item_id() -> String {
@@ -164,6 +196,11 @@ pub struct HistoryRecord {
 struct HistoryEntry {
     title: String,
     username: Option<String>,
+    /// URL ve notlardan önceki sürümlerin geçmişinde yoktur.
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
+    notes: Option<String>,
     password: String,
     replaced_at: u64,
 }
@@ -177,9 +214,13 @@ pub struct HistoryInfo {
     pub replaced_at: u64,
     pub title: String,
     pub username: Option<String>,
+    pub url: Option<String>,
+    pub notes: Option<String>,
     /// Bir sonraki halde değişenler.
     pub title_changed: bool,
     pub username_changed: bool,
+    pub url_changed: bool,
+    pub notes_changed: bool,
     pub password_changed: bool,
 }
 
@@ -303,6 +344,14 @@ fn validate_metadata(metadata: &ItemMetadata) -> Result<(), String> {
         ));
     }
 
+    if metadata.url.as_ref().is_some_and(|url| url.chars().count() > MAX_URL_CHARS) {
+        return Err(format!("URL en fazla {MAX_URL_CHARS} karakter olabilir."));
+    }
+
+    if metadata.notes.as_ref().is_some_and(|notes| notes.chars().count() > MAX_NOTES_CHARS) {
+        return Err(format!("Notlar en fazla {MAX_NOTES_CHARS} karakter olabilir."));
+    }
+
     Ok(())
 }
 
@@ -323,15 +372,11 @@ pub fn encrypt_new_item(
     owner_id: &str,
     title: &str,
     username: Option<&str>,
+    url: Option<&str>,
+    notes: Option<&str>,
     secret: &[u8],
 ) -> Result<NewItem, String> {
-    let metadata = ItemMetadata {
-        title: title.trim().to_string(),
-        username: username
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_string),
-    };
+    let metadata = ItemMetadata::from_input(title, username, url, notes);
 
     validate_metadata(&metadata)?;
     validate_secret(secret)?;
@@ -400,18 +445,29 @@ pub fn history_summary(
     let mut result = Vec::with_capacity(entries.len());
 
     for (position, (id, entry)) in entries.iter().enumerate() {
-        let (next_title, next_username, next_password) = match entries.get(position + 1) {
-            Some((_, next)) => (&next.title, &next.username, &next.password),
-            None => (&metadata.title, &metadata.username, &*current_password),
-        };
+        let (next_title, next_username, next_url, next_notes, next_password) =
+            match entries.get(position + 1) {
+                Some((_, next)) => (&next.title, &next.username, &next.url, &next.notes, &next.password),
+                None => (
+                    &metadata.title,
+                    &metadata.username,
+                    &metadata.url,
+                    &metadata.notes,
+                    &*current_password,
+                ),
+            };
 
         result.push(HistoryInfo {
             id: id.clone(),
             replaced_at: entry.replaced_at,
             title: entry.title.clone(),
             username: entry.username.clone(),
+            url: entry.url.clone(),
+            notes: entry.notes.clone(),
             title_changed: &entry.title != next_title,
             username_changed: &entry.username != next_username,
+            url_changed: &entry.url != next_url,
+            notes_changed: &entry.notes != next_notes,
             password_changed: &entry.password != next_password,
         });
     }
@@ -466,6 +522,8 @@ pub fn rekey(
 pub struct ItemChanges<'a> {
     pub title: &'a str,
     pub username: Option<&'a str>,
+    pub url: Option<&'a str>,
+    pub notes: Option<&'a str>,
     pub password: Option<&'a [u8]>,
 }
 
@@ -520,14 +578,8 @@ fn reencrypt(
     if let Some(changes) = changes {
         let previous: ItemMetadata = serde_json::from_slice(&metadata)
             .map_err(|_| "Kaydın meta verisi okunamadı.".to_string())?;
-        let updated = ItemMetadata {
-            title: changes.title.trim().to_string(),
-            username: changes
-                .username
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(str::to_string),
-        };
+        let updated =
+            ItemMetadata::from_input(changes.title, changes.username, changes.url, changes.notes);
 
         validate_metadata(&updated)?;
 
@@ -544,6 +596,8 @@ fn reencrypt(
             let entry = HistoryEntry {
                 title: previous.title.clone(),
                 username: previous.username.clone(),
+                url: previous.url.clone(),
+                notes: previous.notes.clone(),
                 password: BASE64.encode(secret.as_slice()),
                 replaced_at: now_ms(),
             };
@@ -630,7 +684,7 @@ mod tests {
     fn owner_can_decrypt_own_item() {
         let owner = IdentityKeyPair::generate();
         let new_item =
-            encrypt_new_item(&owner, "owner", " Mail ", Some("ali@x.com"), b"s3cret").unwrap();
+            encrypt_new_item(&owner, "owner", " Mail ", Some("ali@x.com"), None, None, b"s3cret").unwrap();
         let item = stored(&new_item, "owner", new_item.owner_access.clone());
 
         assert_eq!(
@@ -638,9 +692,71 @@ mod tests {
             ItemMetadata {
                 title: "Mail".to_string(),
                 username: Some("ali@x.com".to_string()),
+                url: None,
+                notes: None,
             }
         );
         assert_eq!(decrypt_secret(&owner, &item).unwrap().as_slice(), b"s3cret");
+    }
+
+    #[test]
+    fn url_and_notes_are_kept_trimmed_validated_and_in_history() {
+        let owner = IdentityKeyPair::generate();
+        let new_item = encrypt_new_item(
+            &owner,
+            "owner",
+            "VPN",
+            Some("ali"),
+            Some(" https://vpn.example.com "),
+            Some("  satır 1\nsatır 2\n"),
+            b"pw",
+        )
+        .unwrap();
+        let item = stored(&new_item, "owner", new_item.owner_access.clone());
+
+        let metadata = decrypt_metadata(&owner, &item).unwrap();
+        assert_eq!(metadata.url.as_deref(), Some("https://vpn.example.com"));
+        // Notların satır yapısı ve baştaki boşluklar korunur.
+        assert_eq!(metadata.notes.as_deref(), Some("  satır 1\nsatır 2\n"));
+
+        let long_url = "u".repeat(MAX_URL_CHARS + 1);
+        let long_notes = "n".repeat(MAX_NOTES_CHARS + 1);
+        assert!(encrypt_new_item(&owner, "owner", "A", None, Some(&long_url), None, b"pw").is_err());
+        assert!(encrypt_new_item(&owner, "owner", "A", None, None, Some(&long_notes), b"pw").is_err());
+
+        // Yalnızca not değişikliği de geçmişe yazılır; boş not kaldırılır.
+        let changes = ItemChanges {
+            title: "VPN",
+            username: Some("ali"),
+            url: Some("https://vpn.example.com"),
+            notes: Some("   "),
+            password: None,
+        };
+        let edited = edit(&owner, "owner", &item, &[], &[], &[], &changes).unwrap();
+        let history: Vec<_> = edited
+            .history
+            .iter()
+            .map(|record| HistoryRecord { id: Some("h1".to_string()), entry: record.entry.clone() })
+            .collect();
+        let item = EncryptedItem {
+            metadata: edited.metadata,
+            secret: edited.secret,
+            access: ItemAccess::Direct { access: edited.accesses[0].access.clone() },
+            ..item.clone()
+        };
+
+        assert_eq!(decrypt_metadata(&owner, &item).unwrap().notes, None);
+        let summary = history_summary(&owner, &item, &history).unwrap();
+        assert_eq!(summary.len(), 1);
+        assert_eq!(summary[0].notes.as_deref(), Some("  satır 1\nsatır 2\n"));
+        assert!(summary[0].notes_changed && !summary[0].url_changed && !summary[0].password_changed);
+    }
+
+    #[test]
+    fn metadata_without_url_and_notes_still_reads() {
+        let old: ItemMetadata = serde_json::from_str(r#"{"title":"Eski","username":null}"#).unwrap();
+        assert_eq!(old.url, None);
+        assert_eq!(old.notes, None);
     }
 
     #[test]
@@ -649,7 +765,7 @@ mod tests {
         let recipient = IdentityKeyPair::generate();
         let stranger = IdentityKeyPair::generate();
 
-        let new_item = encrypt_new_item(&owner, "owner", "VPN", None, b"pw").unwrap();
+        let new_item = encrypt_new_item(&owner, "owner", "VPN", None, None, None, b"pw").unwrap();
         let owner_item = stored(&new_item, "owner", new_item.owner_access.clone());
 
         let recipient_access = wrap_for_recipient(
@@ -670,7 +786,7 @@ mod tests {
         let owner = IdentityKeyPair::generate();
         let other = IdentityKeyPair::generate();
 
-        let new_item = encrypt_new_item(&owner, "owner", "VPN", None, b"pw").unwrap();
+        let new_item = encrypt_new_item(&owner, "owner", "VPN", None, None, None, b"pw").unwrap();
         let item = stored(&new_item, "owner", new_item.owner_access.clone());
 
         assert!(rekey(&other, "other", &item, &[], &[], &[]).is_err());
@@ -685,7 +801,7 @@ mod tests {
             public_key: encode_public_key(&identity.public_key()),
         };
 
-        let new_item = encrypt_new_item(&owner, "owner", "VPN", None, b"pw1").unwrap();
+        let new_item = encrypt_new_item(&owner, "owner", "VPN", None, None, None, b"pw1").unwrap();
         let owner_item = stored(&new_item, "owner", new_item.owner_access.clone());
         let editor_item = EncryptedItem {
             access: ItemAccess::Direct {
@@ -695,7 +811,7 @@ mod tests {
             ..owner_item.clone()
         };
 
-        let changes = ItemChanges { title: "VPN", username: None, password: Some(b"pw2") };
+        let changes = ItemChanges { title: "VPN", username: None, password: Some(b"pw2"), url: None, notes: None };
         let edited = edit(
             &editor,
             "editor",
@@ -734,7 +850,7 @@ mod tests {
         let third = IdentityKeyPair::generate();
         let stranger = IdentityKeyPair::generate();
 
-        let new_item = encrypt_new_item(&owner, "owner", "VPN", None, b"pw").unwrap();
+        let new_item = encrypt_new_item(&owner, "owner", "VPN", None, None, None, b"pw").unwrap();
         let owner_item = stored(&new_item, "owner", new_item.owner_access.clone());
 
         let recipient_item = stored(
@@ -766,7 +882,7 @@ mod tests {
         let kept = IdentityKeyPair::generate();
         let removed = IdentityKeyPair::generate();
 
-        let new_item = encrypt_new_item(&owner, "owner", "DB", None, b"pw").unwrap();
+        let new_item = encrypt_new_item(&owner, "owner", "DB", None, None, None, b"pw").unwrap();
         let owner_item = stored(&new_item, "owner", new_item.owner_access.clone());
 
         let removed_access = wrap_for_recipient(
@@ -816,7 +932,7 @@ mod tests {
         let owner = IdentityKeyPair::generate();
         let recipient = IdentityKeyPair::generate();
 
-        let new_item = encrypt_new_item(&owner, "owner", "Eski", Some("ali"), b"pw1").unwrap();
+        let new_item = encrypt_new_item(&owner, "owner", "Eski", Some("ali"), None, None, b"pw1").unwrap();
         let owner_item = stored(&new_item, "owner", new_item.owner_access.clone());
         let recipients = [Recipient {
             user_id: "r".to_string(),
@@ -830,7 +946,7 @@ mod tests {
             &[],
             &recipients,
             &[],
-            &ItemChanges { title: " Yeni ", username: Some(" "), password: None },
+            &ItemChanges { title: " Yeni ", username: Some(" "), password: None, url: None, notes: None },
         )
         .unwrap();
 
@@ -843,7 +959,7 @@ mod tests {
 
         assert_eq!(
             decrypt_metadata(&recipient, &as_recipient).unwrap(),
-            ItemMetadata { title: "Yeni".to_string(), username: None }
+            ItemMetadata { title: "Yeni".to_string(), username: None, url: None, notes: None }
         );
         assert_eq!(decrypt_secret(&recipient, &as_recipient).unwrap().as_slice(), b"pw1");
 
@@ -854,7 +970,7 @@ mod tests {
             &[],
             &[],
             &[],
-            &ItemChanges { title: "Yeni", username: None, password: Some(b"pw2") },
+            &ItemChanges { title: "Yeni", username: None, password: Some(b"pw2"), url: None, notes: None },
         )
         .unwrap();
 
@@ -897,23 +1013,23 @@ mod tests {
             public_key: encode_public_key(&recipient.public_key()),
         }];
 
-        let new_item = encrypt_new_item(&owner, "owner", "VPN", Some("ali"), b"pw1").unwrap();
+        let new_item = encrypt_new_item(&owner, "owner", "VPN", Some("ali"), None, None, b"pw1").unwrap();
         let mut item = stored(&new_item, "owner", new_item.owner_access.clone());
         let mut history = Vec::new();
         let removed_access =
             wrap_for_recipient(&owner, &item, &encode_public_key(&removed.public_key())).unwrap();
 
         // Hiçbir şey değişmezse geçmişe yazılmaz.
-        let same = ItemChanges { title: "VPN", username: Some("ali"), password: Some(b"pw1") };
+        let same = ItemChanges { title: "VPN", username: Some("ali"), password: Some(b"pw1"), url: None, notes: None };
         let unchanged = edit(&owner, "owner", &item, &history, &recipients, &[], &same).unwrap();
         item = apply(&item, unchanged, &mut history);
         assert!(history.is_empty());
 
         // Yalnızca başlık değişikliği de geçmişe yazılır.
-        let renamed = ItemChanges { title: "VPN 2", username: Some("ali"), password: None };
+        let renamed = ItemChanges { title: "VPN 2", username: Some("ali"), password: None, url: None, notes: None };
         item = apply(&item, edit(&owner, "owner", &item, &history, &recipients, &[], &renamed).unwrap(), &mut history);
 
-        let new_password = ItemChanges { title: "VPN 2", username: None, password: Some(b"pw2") };
+        let new_password = ItemChanges { title: "VPN 2", username: None, password: Some(b"pw2"), url: None, notes: None };
         item = apply(&item, edit(&owner, "owner", &item, &history, &recipients, &[], &new_password).unwrap(), &mut history);
         assert_eq!(history.len(), 2);
 
@@ -950,13 +1066,13 @@ mod tests {
     #[test]
     fn history_is_not_limited() {
         let owner = IdentityKeyPair::generate();
-        let new_item = encrypt_new_item(&owner, "owner", "VPN", None, &[b'a'; 4000]).unwrap();
+        let new_item = encrypt_new_item(&owner, "owner", "VPN", None, None, None, &[b'a'; 4000]).unwrap();
         let mut item = stored(&new_item, "owner", new_item.owner_access.clone());
         let mut history = Vec::new();
 
         for n in 1..=30u32 {
             let password = format!("{n:04000}");
-            let changes = ItemChanges { title: "VPN", username: None, password: Some(password.as_bytes()) };
+            let changes = ItemChanges { title: "VPN", username: None, password: Some(password.as_bytes()), url: None, notes: None };
             let edited = edit(&owner, "owner", &item, &history, &[], &[], &changes).unwrap();
             item = apply(&item, edited, &mut history);
         }
@@ -968,13 +1084,13 @@ mod tests {
     #[test]
     fn history_from_another_item_is_rejected() {
         let owner = IdentityKeyPair::generate();
-        let a = encrypt_new_item(&owner, "owner", "A", None, b"pw").unwrap();
-        let b = encrypt_new_item(&owner, "owner", "B", None, b"pw").unwrap();
+        let a = encrypt_new_item(&owner, "owner", "A", None, None, None, b"pw").unwrap();
+        let b = encrypt_new_item(&owner, "owner", "B", None, None, None, b"pw").unwrap();
         let item_a = stored(&a, "owner", a.owner_access.clone());
         let item_b = stored(&b, "owner", b.owner_access.clone());
 
         let mut history = Vec::new();
-        let changes = ItemChanges { title: "A2", username: None, password: None };
+        let changes = ItemChanges { title: "A2", username: None, password: None, url: None, notes: None };
         apply(&item_a, edit(&owner, "owner", &item_a, &[], &[], &[], &changes).unwrap(), &mut history);
 
         // Rekey, açılamayan bir geçmiş kaydıyla yapılmaz (geçmiş kaybolmasın).
@@ -984,13 +1100,13 @@ mod tests {
     #[test]
     fn edit_is_validated() {
         let owner = IdentityKeyPair::generate();
-        let new_item = encrypt_new_item(&owner, "owner", "A", None, b"pw").unwrap();
+        let new_item = encrypt_new_item(&owner, "owner", "A", None, None, None, b"pw").unwrap();
         let item = stored(&new_item, "owner", new_item.owner_access.clone());
 
-        let empty_title = ItemChanges { title: " ", username: None, password: None };
+        let empty_title = ItemChanges { title: " ", username: None, password: None, url: None, notes: None };
         assert!(edit(&owner, "owner", &item, &[], &[], &[], &empty_title).is_err());
 
-        let empty_password = ItemChanges { title: "B", username: None, password: Some(b"") };
+        let empty_password = ItemChanges { title: "B", username: None, password: Some(b""), url: None, notes: None };
         assert!(edit(&owner, "owner", &item, &[], &[], &[], &empty_password).is_err());
     }
 
@@ -1000,7 +1116,7 @@ mod tests {
         let department = IdentityKeyPair::generate();
         let member = IdentityKeyPair::generate();
 
-        let new_item = encrypt_new_item(&owner, "owner", "VPN", None, b"pw").unwrap();
+        let new_item = encrypt_new_item(&owner, "owner", "VPN", None, None, None, b"pw").unwrap();
         let owner_item = stored(&new_item, "owner", new_item.owner_access.clone());
 
         let item_key =
@@ -1025,7 +1141,7 @@ mod tests {
         let owner = IdentityKeyPair::generate();
         let department = IdentityKeyPair::generate();
 
-        let new_item = encrypt_new_item(&owner, "owner", "VPN", None, b"pw").unwrap();
+        let new_item = encrypt_new_item(&owner, "owner", "VPN", None, None, None, b"pw").unwrap();
         let owner_item = stored(&new_item, "owner", new_item.owner_access.clone());
 
         let rekeyed = rekey(
@@ -1054,8 +1170,8 @@ mod tests {
     #[test]
     fn ciphertext_moved_to_another_item_is_rejected() {
         let owner = IdentityKeyPair::generate();
-        let first = encrypt_new_item(&owner, "owner", "A", None, b"a").unwrap();
-        let second = encrypt_new_item(&owner, "owner", "B", None, b"b").unwrap();
+        let first = encrypt_new_item(&owner, "owner", "A", None, None, None, b"a").unwrap();
+        let second = encrypt_new_item(&owner, "owner", "B", None, None, None, b"b").unwrap();
 
         let mut swapped = stored(&second, "owner", first.owner_access.clone());
         swapped.metadata = first.metadata.clone();
@@ -1068,7 +1184,7 @@ mod tests {
     fn empty_title_and_secret_are_rejected() {
         let owner = IdentityKeyPair::generate();
 
-        assert!(encrypt_new_item(&owner, "owner", "  ", None, b"pw").is_err());
-        assert!(encrypt_new_item(&owner, "owner", "T", None, b"").is_err());
+        assert!(encrypt_new_item(&owner, "owner", "  ", None, None, None, b"pw").is_err());
+        assert!(encrypt_new_item(&owner, "owner", "T", None, None, None, b"").is_err());
     }
 }

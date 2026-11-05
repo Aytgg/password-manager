@@ -443,6 +443,8 @@ fn encrypt_new_item(
     session: tauri::State<'_, Arc<VaultSession>>,
     title: String,
     username: Option<String>,
+    url: Option<String>,
+    notes: Option<String>,
     password: String,
 ) -> Result<NewItem, String> {
     let password = Zeroizing::new(password);
@@ -453,6 +455,8 @@ fn encrypt_new_item(
             &owner.user_id,
             &title,
             username.as_deref(),
+            url.as_deref(),
+            notes.as_deref(),
             password.as_bytes(),
         )
     })
@@ -464,6 +468,8 @@ struct DecryptedItemMetadata {
     item_id: String,
     title: Option<String>,
     username: Option<String>,
+    url: Option<String>,
+    notes: Option<String>,
     error: Option<String>,
 }
 
@@ -482,12 +488,16 @@ fn decrypt_items_metadata(
                     item_id: item.item_id.clone(),
                     title: Some(metadata.title),
                     username: metadata.username,
+                    url: metadata.url,
+                    notes: metadata.notes,
                     error: None,
                 },
                 Err(error) => DecryptedItemMetadata {
                     item_id: item.item_id.clone(),
                     title: None,
                     username: None,
+                    url: None,
+                    notes: None,
                     error: Some(error),
                 },
             })
@@ -573,6 +583,8 @@ fn edit_item(
     department_recipients: Vec<DepartmentRecipient>,
     title: String,
     username: Option<String>,
+    url: Option<String>,
+    notes: Option<String>,
     password: Option<String>,
 ) -> Result<RekeyedItem, String> {
     let password = password.filter(|value| !value.is_empty()).map(Zeroizing::new);
@@ -588,6 +600,8 @@ fn edit_item(
             &items::ItemChanges {
                 title: &title,
                 username: username.as_deref(),
+                url: url.as_deref(),
+                notes: notes.as_deref(),
                 password: password.as_ref().map(|value| value.as_bytes()),
             },
         )

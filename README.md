@@ -158,9 +158,9 @@ Her kaydın kendine ait rastgele bir **DEK**'i (32 bayt) vardır. Kayıt iki ayr
 
 | Alan | İçerik | AAD |
 |---|---|---|
-| `metadata` | `{ "title", "username" }` JSON | `password-manager/item/v1/metadata:{sahipId}:{kayıtId}` |
+| `metadata` | `{ "title", "username", "url", "notes" }` JSON | `password-manager/item/v1/metadata:{sahipId}:{kayıtId}` |
 | `secret` | Parola baytları | `password-manager/item/v1/secret:{sahipId}:{kayıtId}` |
-| `itemHistory.entry` | Önceki hal: `{ "title", "username", "password" (base64), "replacedAt" }` JSON | `password-manager/item/v1/history:{sahipId}:{kayıtId}` |
+| `itemHistory.entry` | Önceki hal: `{ "title", "username", "url", "notes", "password" (base64), "replacedAt" }` JSON | `password-manager/item/v1/history:{sahipId}:{kayıtId}` |
 
 Alanların ayrı olması sayesinde liste görüntülenirken parolaların kendisi
 çözülmez. AAD şifreli veriyi sahibine ve kayıt kimliğine bağlar: sunucu bir
@@ -186,8 +186,10 @@ Kayıt kimliği (`item-<32 hex>`) istemcide rastgele üretilir. Bu sayede
 çevrimdışı oluşturulan kayıtlar çakışmadan gönderilebilir ve aynı kayıt
 tekrar gönderilirse sunucu mevcut kaydı döndürür.
 
-Sınırlar: başlık en fazla 200, kullanıcı adı en fazla 320 karakter; parola en
-fazla 4096 bayt.
+Sınırlar: başlık en fazla 200, kullanıcı adı en fazla 320, URL en fazla 2048,
+notlar en fazla 10.000 karakter; parola en fazla 4096 bayt. Parola tekrarı
+yalnızca formda kontrol edilir, saklanmaz. URL ve notlar eski kayıtlarda
+yoktur ve boş kabul edilir.
 
 ### Key wrapping
 

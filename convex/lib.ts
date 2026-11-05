@@ -330,7 +330,8 @@ const BASE64 = /^[A-Za-z0-9+/]*={0,2}$/;
 
 const PUBLIC_KEY_LENGTH = 44;
 const NONCE_LENGTH = 16;
-const MAX_CIPHERTEXT_LENGTH = 16 * 1024;
+// Notlar alanı (en fazla 10.000 karakter) meta veriye sığmalı.
+const MAX_CIPHERTEXT_LENGTH = 64 * 1024;
 
 function assertBase64(value: string, field: string, length?: number) {
   if (!BASE64.test(value) || value.length % 4 !== 0) {

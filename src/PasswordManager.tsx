@@ -33,6 +33,8 @@ type DecryptedMetadata = {
   itemId: string;
   title: string | null;
   username: string | null;
+  url: string | null;
+  notes: string | null;
   error: string | null;
 };
 
@@ -40,6 +42,8 @@ type PasswordItem = {
   vault: VaultItem;
   title: string;
   username: string | null;
+  url: string | null;
+  notes: string | null;
   /** Başlık ve kullanıcı adı çözüldü; düzenleme ancak o zaman açılır. */
   decrypted: boolean;
 };
@@ -660,8 +664,12 @@ type HistoryInfo = {
   replacedAt: number;
   title: string;
   username: string | null;
+  url: string | null;
+  notes: string | null;
   titleChanged: boolean;
   usernameChanged: boolean;
+  urlChanged: boolean;
+  notesChanged: boolean;
   passwordChanged: boolean;
 };
 
@@ -674,6 +682,8 @@ function describeChange(entry: HistoryInfo) {
   const changes = [
     entry.titleChanged && "başlık",
     entry.usernameChanged && "kullanıcı adı",
+    entry.urlChanged && "URL",
+    entry.notesChanged && "notlar",
     entry.passwordChanged && "parola",
   ].filter(Boolean);
 
@@ -751,6 +761,24 @@ function PasswordHistoryPanel({ id }: { id: Id<"items"> }) {
                 <div style={{ ...styles.muted, fontSize: 12, marginTop: 2 }}>
                   {historyDateFormat.format(new Date(entry.replacedAt))} · {describeChange(entry)}
                 </div>
+                {entry.urlChanged && (
+                  <div style={{ ...styles.muted, fontSize: 12, marginTop: 2, overflowWrap: "anywhere" }}>
+                    Önceki URL: {entry.url || "—"}
+                  </div>
+                )}
+                {entry.notesChanged && (
+                  <div
+                    style={{
+                      ...styles.muted,
+                      fontSize: 12,
+                      marginTop: 2,
+                      whiteSpace: "pre-wrap",
+                      overflowWrap: "anywhere",
+                    }}
+                  >
+                    Önceki notlar: {entry.notes || "—"}
+                  </div>
+                )}
               </div>
 
             </div>
@@ -819,6 +847,139 @@ function DeleteItemForm({
   );
 }
 
+type ItemFormValues = {
+  title: string;
+  username: string;
+  password: string;
+  passwordRepeat: string;
+  url: string;
+  notes: string;
+};
+
+const EMPTY_FORM: ItemFormValues = {
+  title: "",
+  username: "",
+  password: "",
+  passwordRepeat: "",
+  url: "",
+  notes: "",
+};
+
+/** Formun gönderilmeden önceki kontrolü; sorun yoksa `null`. Düzenlemede
+ * parola boş bırakılırsa mevcut parola korunur. */
+function formProblem(values: ItemFormValues, editing: boolean) {
+  if (!values.title.trim()) return "Başlık boş olamaz.";
+  if (!editing && !values.password) return "Parola boş olamaz.";
+  if (values.password !== values.passwordRepeat) return "Parolalar eşleşmiyor.";
+  return null;
+}
+
+/** Rust'a giden alanlar; boş alanlar `null`. */
+function formPayload(values: ItemFormValues) {
+  return {
+    title: values.title.trim(),
+    username: values.username.trim() || null,
+    url: values.url.trim() || null,
+    notes: values.notes.trim() ? values.notes : null,
+    password: values.password || null,
+  };
+}
+
+/** Yeni kayıt ve düzenleme formlarının ortak alanları. */
+function ItemFormFields({
+  idPrefix,
+  values,
+  editing,
+  disabled,
+  autoFocus,
+  onChange,
+}: {
+  idPrefix: string;
+  values: ItemFormValues;
+  editing: boolean;
+  disabled: boolean;
+  autoFocus?: boolean;
+  onChange: (values: ItemFormValues) => void;
+}) {
+  const field = (key: keyof ItemFormValues) => ({
+    id: `${idPrefix}-${key}`,
+    value: values[key],
+    disabled,
+    onChange: (event: { target: { value: string } }) =>
+      onChange({ ...values, [key]: event.target.value }),
+  });
+  const mismatch = values.passwordRepeat !== "" && values.password !== values.passwordRepeat;
+
+  return (
+    <>
+      <label htmlFor={`${idPrefix}-title`}>Başlık</label>
+      <input
+        {...field("title")}
+        style={styles.input}
+        placeholder="Örn. Şirket e-postası"
+        maxLength={200}
+        required
+        autoFocus={autoFocus}
+      />
+
+      <label htmlFor={`${idPrefix}-username`}>Kullanıcı adı / e-posta (isteğe bağlı)</label>
+      <input
+        {...field("username")}
+        style={styles.input}
+        placeholder="kullanici@example.com"
+        maxLength={320}
+        autoComplete="off"
+      />
+
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: "0 12px" }}>
+        <div>
+          <label htmlFor={`${idPrefix}-password`}>{editing ? "Yeni parola" : "Parola"}</label>
+          <input
+            {...field("password")}
+            type="password"
+            autoComplete="new-password"
+            style={styles.input}
+            placeholder={editing ? "Değiştirmeyeceksen boş bırak" : undefined}
+            required={!editing}
+          />
+        </div>
+        <div>
+          <label htmlFor={`${idPrefix}-passwordRepeat`}>Parola tekrarı</label>
+          <input
+            {...field("passwordRepeat")}
+            type="password"
+            autoComplete="new-password"
+            style={{ ...styles.input, borderColor: mismatch ? "#f87171" : undefined }}
+            required={!editing || values.password !== ""}
+            aria-invalid={mismatch}
+          />
+        </div>
+      </div>
+      {mismatch && (
+        <p role="alert" style={{ ...styles.error, marginTop: -6, fontSize: 13 }}>
+          Parolalar eşleşmiyor.
+        </p>
+      )}
+
+      <label htmlFor={`${idPrefix}-url`}>URL (isteğe bağlı)</label>
+      <input
+        {...field("url")}
+        type="url"
+        style={styles.input}
+        placeholder="https://example.com/login"
+        maxLength={2048}
+      />
+
+      <label htmlFor={`${idPrefix}-notes`}>Notlar (isteğe bağlı)</label>
+      <textarea
+        {...field("notes")}
+        style={{ ...styles.input, minHeight: 90, resize: "vertical", fontFamily: "inherit" }}
+        maxLength={10000}
+      />
+    </>
+  );
+}
+
 /**
  * Kaydın başlığını, kullanıcı adını ve parolasını değiştirir. Düzenleme yetkisi olan
  * herkes düzenleyebilir. Her düzenleme yeni bir DEK ile yapılır ve erişimi olan
@@ -832,7 +993,13 @@ function EditItemForm({
   canDelete,
   onDeleted,
 }: {
-  item: { id: Id<"items">; title: string; username: string | null };
+  item: {
+    id: Id<"items">;
+    title: string;
+    username: string | null;
+    url: string | null;
+    notes: string | null;
+  };
   onCancel: () => void;
   onSaved: () => void;
   canDelete: boolean;
@@ -843,9 +1010,13 @@ function EditItemForm({
   const removeItem = useMutation(api.items.remove);
   const [confirmingDelete, setConfirmingDelete] = useState(false);
 
-  const [title, setTitle] = useState(item.title);
-  const [username, setUsername] = useState(item.username ?? "");
-  const [password, setPassword] = useState("");
+  const [values, setValues] = useState<ItemFormValues>({
+    ...EMPTY_FORM,
+    title: item.title,
+    username: item.username ?? "",
+    url: item.url ?? "",
+    notes: item.notes ?? "",
+  });
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
@@ -856,8 +1027,9 @@ function EditItemForm({
 
     if (saving) return;
 
-    if (!title.trim()) {
-      setError("Başlık boş olamaz.");
+    const problem = formProblem(values, true);
+    if (problem) {
+      setError(problem);
       return;
     }
 
@@ -874,14 +1046,12 @@ function EditItemForm({
         history: targets.history,
         recipients: targets.recipients,
         departmentRecipients: targets.departments,
-        title: title.trim(),
-        username: username.trim() || null,
-        password: password || null,
+        ...formPayload(values),
       });
 
       await rekeyItem({ id: item.id, keyVersion: targets.item.keyVersion, ...edited });
 
-      setPassword("");
+      setValues((current) => ({ ...current, password: "", passwordRepeat: "" }));
       onSaved();
     } catch (err) {
       setError(errorMessage(err));
@@ -906,36 +1076,13 @@ function EditItemForm({
   }
 
   return (
-    <form onSubmit={handleSubmit}>
-      <label htmlFor={`edit-title-${item.id}`}>Başlık</label>
-      <input
-        id={`edit-title-${item.id}`}
-        style={styles.input}
-        value={title}
-        onChange={(event) => setTitle(event.target.value)}
+    <form onSubmit={handleSubmit} style={{ maxWidth: 620 }}>
+      <ItemFormFields
+        idPrefix={`edit-${item.id}`}
+        values={values}
+        editing
         disabled={saving}
-        required
-      />
-
-      <label htmlFor={`edit-username-${item.id}`}>Kullanıcı adı (isteğe bağlı)</label>
-      <input
-        id={`edit-username-${item.id}`}
-        style={styles.input}
-        value={username}
-        onChange={(event) => setUsername(event.target.value)}
-        disabled={saving}
-      />
-
-      <label htmlFor={`edit-password-${item.id}`}>Yeni parola</label>
-      <input
-        id={`edit-password-${item.id}`}
-        type="password"
-        autoComplete="new-password"
-        style={styles.input}
-        value={password}
-        onChange={(event) => setPassword(event.target.value)}
-        placeholder="Değiştirmeyeceksen boş bırak"
-        disabled={saving}
+        onChange={setValues}
       />
 
       {error && (
@@ -1421,9 +1568,7 @@ function NewItemForm({
   onCreated: (itemId: string, message: string) => void;
   onCancel: () => void;
 }) {
-  const [title, setTitle] = useState("");
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
+  const [values, setValues] = useState<ItemFormValues>(EMPTY_FORM);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
 
@@ -1432,8 +1577,9 @@ function NewItemForm({
   ) {
     event.preventDefault();
 
-    if (!title.trim() || !password) {
-      setError("Başlık ve parola alanları zorunludur.");
+    const problem = formProblem(values, false);
+    if (problem) {
+      setError(problem);
       return;
     }
 
@@ -1443,9 +1589,8 @@ function NewItemForm({
     try {
       // Şifreleme Rust'ta yapılır; Convex'e yalnızca şifreli veri gider.
       const encrypted = await invoke<NewItem>("encrypt_new_item", {
-        title: title.trim(),
-        username: username.trim() || null,
-        password,
+        ...formPayload(values),
+        password: values.password,
       });
 
       data.addItem(encrypted, folderId);
@@ -1463,39 +1608,17 @@ function NewItemForm({
   }
 
   return (
-    <form onSubmit={handleSubmit} style={{ maxWidth: 520 }}>
+    <form onSubmit={handleSubmit} style={{ maxWidth: 620 }}>
       <h3 style={{ marginTop: 0 }}>Yeni parola</h3>
       <p style={{ ...styles.muted, fontSize: 13 }}>Konum: {tree.pathText(folderId)}</p>
 
-      <label htmlFor="password-title">Başlık</label>
-      <input
-        id="password-title"
-        style={styles.input}
-        value={title}
-        onChange={(event) => setTitle(event.target.value)}
-        placeholder="Örn. E-posta"
-        required
+      <ItemFormFields
+        idPrefix="new-item"
+        values={values}
+        editing={false}
+        disabled={saving}
         autoFocus
-      />
-
-      <label htmlFor="password-username">Kullanıcı adı (isteğe bağlı)</label>
-      <input
-        id="password-username"
-        style={styles.input}
-        value={username}
-        onChange={(event) => setUsername(event.target.value)}
-        placeholder="kullanici@example.com"
-      />
-
-      <label htmlFor="password-value">Parola</label>
-      <input
-        id="password-value"
-        type="password"
-        autoComplete="new-password"
-        style={styles.input}
-        value={password}
-        onChange={(event) => setPassword(event.target.value)}
-        required
+        onChange={setValues}
       />
 
       {error && (
@@ -1574,6 +1697,8 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
             vault: item,
             title: metadata?.title ?? (metadata?.error ? "Çözülemedi" : "…"),
             username: metadata?.username ?? null,
+            url: metadata?.url ?? null,
+            notes: metadata?.notes ?? null,
             decrypted: typeof metadata?.title === "string",
           };
         })
@@ -1593,7 +1718,8 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
     (item) =>
       !query ||
       item.title.toLocaleLowerCase("tr").includes(query) ||
-      (item.username ?? "").toLocaleLowerCase("tr").includes(query),
+      (item.username ?? "").toLocaleLowerCase("tr").includes(query) ||
+      (item.url ?? "").toLocaleLowerCase("tr").includes(query),
   );
 
   const selected = items.find((item) => item.vault.itemId === selectedItemId) ?? null;
@@ -1970,7 +2096,13 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
           ) : mode === "edit" && selected.vault.id !== null ? (
             <EditItemForm
               key={selected.vault.itemId}
-              item={{ id: selected.vault.id, title: selected.title, username: selected.username }}
+              item={{
+                id: selected.vault.id,
+                title: selected.title,
+                username: selected.username,
+                url: selected.url,
+                notes: selected.notes,
+              }}
               onCancel={() => setMode("view")}
               onSaved={() => {
                 setMode("view");
@@ -1991,9 +2123,15 @@ export default function PasswordManager({ data, isOnline }: PasswordManagerProps
                 <dt style={styles.muted}>Başlık</dt>
                 <dd style={{ margin: 0 }}>{selected.title}</dd>
                 <dt style={styles.muted}>Kullanıcı adı</dt>
-                <dd style={{ margin: 0 }}>{selected.username || "—"}</dd>
+                <dd style={{ margin: 0, overflowWrap: "anywhere" }}>{selected.username || "—"}</dd>
                 <dt style={styles.muted}>Parola</dt>
                 <dd style={{ margin: 0, letterSpacing: 2 }}>••••••••</dd>
+                <dt style={styles.muted}>URL</dt>
+                <dd style={{ margin: 0, overflowWrap: "anywhere" }}>{selected.url || "—"}</dd>
+                <dt style={styles.muted}>Notlar</dt>
+                <dd style={{ margin: 0, whiteSpace: "pre-wrap", overflowWrap: "anywhere" }}>
+                  {selected.notes || "—"}
+                </dd>
                 <dt style={styles.muted}>Sahip</dt>
                 <dd style={{ margin: 0 }}>{selected.vault.isOwner ? "Sen" : "Seninle paylaşılmış"}</dd>
                 <dt style={styles.muted}>Yetkilerin</dt>
