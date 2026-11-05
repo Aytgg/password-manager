@@ -938,7 +938,7 @@ export const editTargets = query({
  * Kayıtlarla ilgili, istemcinin arka planda yapması gereken şifreleme işleri:
  * - fills: doğrudan erişimim olan kayıtlarda, kurala göre paketi eksik
  *   kullanıcılar ve departmanlar (paketleri ben üretirim).
- * - rekeys: sahibi olduğum ve erişimi kaldırılmış kayıtlar (yeni DEK).
+ * - rekeys: düzenleyebildiğim ve erişimi kaldırılmış kayıtlar (yeni DEK).
  */
 export const pendingWork = query({
   args: {},
@@ -960,15 +960,19 @@ export const pendingWork = query({
 
       const { recipients, currentUsers, departments } = await keyTargets(ctx, item);
 
+      const permissions = await itemPermissions(ctx, user, item);
       const serialized = serialize(
         item,
         { kind: "direct", access: access.access },
         user._id,
-        await itemPermissions(ctx, user, item),
+        permissions,
       );
 
       if (item.needsRekey) {
-        if (item.ownerId === user._id) {
+        // Sahip, yöneticiler ve düzenleme yetkisi olanlar yapabilir; sahibin
+        // çevrimiçi olmasını beklemek gerekmez. Birden fazla cihaz aynı anda
+        // denerse yalnız biri kabul edilir (keyVersion).
+        if (permissions.edit) {
           rekeys.push({
             item: serialized,
             history: await historyRecords(ctx, item._id),

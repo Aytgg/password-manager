@@ -323,4 +323,61 @@ describe("uçtan uca: departman üzerinden paylaşım", () => {
     expect(await view(carol, item, adminId)).toEqual({ visible: true, via: "department", pending: 0, hasKey: true });
     expect(await view(mia, item, adminId)).toEqual({ visible: true, via: "department", pending: 0, hasKey: true });
   });
+
+  test("sahip çevrimdışıyken yönetici departmana yetki verir", async () => {
+    const { adminId, asId, open, invite, register, createItem, view } = await world();
+    const admin = asId(adminId);
+
+    await open(adminId);
+    const yazilim = await admin.mutation(api.departments.create, { name: "Yazılım" });
+    const satis = await admin.mutation(api.departments.create, { name: "Satış" });
+    const sw = await invite("sw@vs.com", yazilim);
+    const carol = await invite("carol@vs.com", satis);
+    await open(adminId);
+    await register(sw);
+    await open(sw);
+    await register(carol);
+    await open(carol);
+
+    const item = await createItem(sw);
+    await open(sw);
+    await open(adminId);
+    // Sahip artık çevrimdışı; yönetici paylaşır.
+    await admin.mutation(api.items.setDepartmentGrant, { id: item, departmentId: satis, granted: true });
+    await open(adminId);
+
+    expect(await view(carol, item, adminId)).toEqual({ visible: true, via: "department", pending: 0, hasKey: true });
+  });
+
+  test("sahip çevrimdışıyken yönetici bir yetkiyi kaldırıp başka departmana verir", async () => {
+    const { adminId, asId, open, invite, register, createItem, view } = await world();
+    const admin = asId(adminId);
+
+    await open(adminId);
+    const yazilim = await admin.mutation(api.departments.create, { name: "Yazılım" });
+    const satis = await admin.mutation(api.departments.create, { name: "Satış" });
+    const destek = await admin.mutation(api.departments.create, { name: "Destek" });
+    const sw = await invite("sw@vs.com", yazilim);
+    const carol = await invite("carol@vs.com", satis);
+    const dave = await invite("dave@vs.com", destek);
+    await open(adminId);
+    for (const user of [sw, carol, dave]) {
+      await register(user);
+      await open(user);
+    }
+
+    const item = await createItem(sw);
+    await asId(sw).mutation(api.items.setDepartmentGrant, { id: item, departmentId: destek, granted: true });
+    await open(sw);
+    await open(adminId);
+
+    // Sahip çevrimdışı. Yönetici Destek'in yetkisini kaldırır (kayıt yeniden
+    // şifrelenmeli) ve Satış'a verir.
+    await admin.mutation(api.items.setDepartmentGrant, { id: item, departmentId: destek, granted: false });
+    await admin.mutation(api.items.setDepartmentGrant, { id: item, departmentId: satis, granted: true });
+    await open(adminId);
+
+    expect(await view(carol, item, adminId)).toEqual({ visible: true, via: "department", pending: 0, hasKey: true });
+    expect((await view(dave, item, adminId)).visible).toBe(false);
+  });
 });
